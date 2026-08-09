@@ -1,0 +1,18 @@
+[book]
+title = "rsshogi-csa Documentation"
+authors = ["rsshogi contributors"]
+language = "ja"
+description = "CSA 対局サーバーへ USI エンジンを参加させる rsshogi-csa のドキュメント。"
+
+[build]
+build-dir = "build"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "ayu"
+cname = ""
+git-repository-url = "https://github.com/nyoki-mtl/rsshogi-csa"
+
+[output.html.print]
+enable = false
