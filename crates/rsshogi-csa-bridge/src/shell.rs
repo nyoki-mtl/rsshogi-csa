@@ -31,6 +31,7 @@ use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 use crate::record::{LogRecord, Millis};
 use crate::session::{Action, Event, OperatorCommand, SessionCore};
@@ -124,6 +125,7 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
         events_log_lost: false,
         log_tx,
         server_write: None,
+        server_reader: None,
         engine_stdin: None,
         child: None,
         engine_generation: 0,
@@ -146,6 +148,7 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
     }
 
     shell.stop_engine().await;
+    shell.stop_server_reader().await;
     let events_log_lost = shell.events_log_lost;
     drop(shell);
 
@@ -185,6 +188,7 @@ struct Shell {
     event_tx: mpsc::UnboundedSender<Incoming>,
     log_tx: mpsc::UnboundedSender<LogLine>,
     server_write: Option<OwnedWriteHalf>,
+    server_reader: Option<JoinHandle<()>>,
     engine_stdin: Option<ChildStdin>,
     child: Option<Child>,
     engine_generation: u64,
@@ -396,12 +400,13 @@ impl Shell {
         // Small lines with a hard latency budget: never wait for a full segment.
         stream.set_nodelay(true)?;
         let (read, write) = stream.into_split();
+        self.stop_server_reader().await;
         self.server_write = Some(write);
 
         let tx = self.event_tx.clone();
         let log_tx = self.log_tx.clone();
         let start = self.start;
-        tokio::spawn(async move {
+        self.server_reader = Some(tokio::spawn(async move {
             let mut lines = BufReader::new(read).lines();
             loop {
                 let Ok(Some(line)) = lines.next_line().await else {
@@ -414,10 +419,20 @@ impl Shell {
                     return;
                 }
             }
-        });
+        }));
 
         let _ = self.event_tx.send(Incoming::Event(Event::Connected { at: self.now() }));
         Ok(())
+    }
+
+    async fn stop_server_reader(&mut self) {
+        self.server_write = None;
+        if let Some(reader) = self.server_reader.take() {
+            // Await cancellation so the task has dropped its log sender before
+            // `run` closes the channel and joins the writer.
+            reader.abort();
+            let _ = reader.await;
+        }
     }
 
     async fn write_server(&mut self, line: &str) -> io::Result<()> {

@@ -1,6 +1,6 @@
 [package]
 name = "rsshogi-csa"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.95"
 description = "Engine-agnostic CSA shogi server protocol command model, parser, and formatter"

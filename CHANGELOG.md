@@ -5,6 +5,13 @@
 
 ## [Unreleased]
 
+## [0.1.2] - 2026-08-09
+
+### Fixed
+
+- 規定局数の完走後にCSA serverが接続を閉じない場合、socket readerがlog channelを
+  保持して`csabridge.exe`が終了しない問題を修正した
+
 ## [0.1.1] - 2026-08-09
 
 ### Added
