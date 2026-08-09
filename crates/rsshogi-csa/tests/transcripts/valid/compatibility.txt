@@ -1,0 +1,27 @@
+; Permissive input on the left, canonical output on the right.
+; This file doubles as the specification of what parse_line normalizes.
+
+; Extra whitespace between tokens collapses.
+LOGIN  engine   secret => LOGIN engine secret
+LOGIN engine secret  x1 => LOGIN engine secret x1
+AGREE    game-1 => AGREE game-1
+REJECT    game-1 => REJECT game-1
+%%GAME  floodgate-900-0   * => %%GAME floodgate-900-0 *
+%%SHOW   game-1 => %%SHOW game-1
+
+; A chat message keeps its interior spacing but loses the leading run.
+%%CHAT    hello  world => %%CHAT hello  world
+
+; Elapsed times are read as numbers, so leading zeros disappear.
++7776FU,T012 => +7776FU,T12
+%KACHI,T007 => %KACHI,T7
+
+; A repeated time annotation keeps the last one rather than failing.
++7776FU,T1,T2 => +7776FU,T2
+
+; Unknown special moves and end markers keep their spelling.
+%SOMETHING_NEW => %SOMETHING_NEW
+#SOMETHING_NEW => #SOMETHING_NEW
+
+; Unknown administrative commands keep their arguments, with spacing collapsed.
+%%NEWCOMMAND  a   b => %%NEWCOMMAND a b

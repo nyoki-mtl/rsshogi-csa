@@ -1,0 +1,17 @@
+; Lines that parse_line accepts but that are not the canonical spelling.
+; parse_line_strict must reject every one of them.
+
+LOGIN  engine secret
+LOGIN engine  secret
+LOGIN engine secret  x1
+AGREE   game-1
+REJECT   game-1
+%%GAME  floodgate-900-0 *
+%%GAME floodgate-900-0  *
+%%CHALLENGE  test-1500-0 +
+%%SHOW  game-1
+%%CHAT  hello world
+%%NEWCOMMAND  a b
++7776FU,T012
+%KACHI,T007
++7776FU,T1,T2

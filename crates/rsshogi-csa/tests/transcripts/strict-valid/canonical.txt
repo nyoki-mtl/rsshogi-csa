@@ -1,0 +1,36 @@
+; Lines that are already canonical and must pass parse_line_strict.
+
+LOGIN engine secret
+LOGIN engine floodgate-900-0,secret x1
+LOGOUT
+AGREE
+AGREE game-1
+REJECT game-1
+CHALLENGE
+CHALLENGE ACCEPTED
+LOGIN:engine OK
+LOGIN:incorrect
+LOGOUT:completed
+BEGIN Game_Summary
+START:game-1
+REJECT:game-1 by the Server (timed out)
++7776FU
++7776FU,T12
+-8384FU,T7,'* 60 +2625FU
+%TORYO
+%KACHI,T20
+%+ILLEGAL_ACTION
+%-ILLEGAL_ACTION
+#RESIGN
+#WIN
+#SENNICHITE
+#CENSORED
+##[ERROR] unknown command: NOPE
+##[LIST] +OK
+%%GAME
+%%GAME floodgate-900-0 *
+%%CHALLENGE test-1500-0 +
+%%WHO
+%%SHOW game-1
+%%CHAT hello world
+%%SETBUOY buoy_test-1500-0 +7776FUT2 3

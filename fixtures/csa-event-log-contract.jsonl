@@ -1,0 +1,30 @@
+{"at":0,"engine_cmd":"engine.exe","game_id":null,"schema":1,"seq":1,"ts":1800000000000,"type":"bridge_start","version":"0.1.0"}
+{"at":0,"game_id":null,"phase":"warming","schema":1,"seq":2,"ts":1800000000000,"type":"state"}
+{"at":10,"author":"Fixture Author","game_id":null,"name":"Fixture Engine","options":[{"name":"Threads","value":"4"},{"name":"USI_Hash","value":"1024"}],"schema":1,"seq":3,"ts":1800000000010,"type":"engine_meta"}
+{"at":20,"game_id":null,"phase":"connecting","schema":1,"seq":4,"ts":1800000000020,"type":"state"}
+{"at":25,"code":"unreadable_engine_line","detail":"not a usi command","game_id":null,"level":"warn","schema":1,"seq":5,"ts":1800000000025,"type":"alert"}
+{"at":40,"game_id":null,"phase":"waiting_pairing","schema":1,"seq":6,"ts":1800000000040,"type":"state"}
+{"at":60040,"game_id":null,"schema":1,"seq":7,"ts":1800000060040,"type":"heartbeat"}
+{"at":100023,"entering_king_rule":"CSARule27","game_id":"test+floodgate-300-10F+us+them+20260807120000","initial_sfen":"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1","max_moves":256,"moves_so_far":[],"my_color":"black","names":{"black":"us","white":"them"},"schema":1,"seq":8,"time":{"byoyomi_ms":0,"inc_ms":10000,"least_ms":0,"roundup":false,"total_ms":300000,"unit_ms":1000},"ts":1800000100023,"type":"game_start"}
+{"at":100023,"game_id":"test+floodgate-300-10F+us+them+20260807120000","phase":"agreed","schema":1,"seq":9,"ts":1800000100023,"type":"state"}
+{"at":101000,"game_id":"test+floodgate-300-10F+us+them+20260807120000","phase":"playing","schema":1,"seq":10,"ts":1800000101000,"type":"state"}
+{"at":101000,"deadline_at":408499,"game_id":"test+floodgate-300-10F+us+them+20260807120000","ply":0,"schema":1,"seq":11,"times":{"binc_ms":10000,"btime_ms":297500,"byoyomi_ms":null,"winc_ms":10000,"wtime_ms":300000},"ts":1800000101000,"type":"go"}
+{"at":102100,"black_remaining_ms":308000,"by":"engine","csa":"+7776FU","eval":{"cp":null,"depth":null,"mate":null,"nodes":null,"pv_usi":[]},"game_id":"test+floodgate-300-10F+us+them+20260807120000","ply":1,"schema":1,"seq":12,"side":"black","t_ms":2000,"ts":1800000102100,"type":"move","usi":"7g7f","white_remaining_ms":300000}
+{"at":103000,"black_remaining_ms":308000,"by":"opponent","csa":"-3334FU","eval":null,"game_id":"test+floodgate-300-10F+us+them+20260807120000","ply":2,"schema":1,"seq":13,"side":"white","t_ms":3000,"ts":1800000103000,"type":"move","usi":"3c3d","white_remaining_ms":307000}
+{"at":103000,"deadline_at":418499,"game_id":"test+floodgate-300-10F+us+them+20260807120000","ply":2,"schema":1,"seq":14,"times":{"binc_ms":10000,"btime_ms":305500,"byoyomi_ms":null,"winc_ms":10000,"wtime_ms":307000},"ts":1800000103000,"type":"go"}
+{"at":104000,"code":"suspect_resign","detail":"resign from a position the engine did not report as lost","game_id":"test+floodgate-300-10F+us+them+20260807120000","level":"error","schema":1,"seq":15,"ts":1800000104000,"type":"alert"}
+{"at":104300,"black_remaining_ms":308000,"game_id":"test+floodgate-300-10F+us+them+20260807120000","result":"lose","schema":1,"seq":16,"terminal":["%TORYO","#RESIGN","#LOSE"],"ts":1800000104300,"type":"game_end","white_remaining_ms":307000}
+{"at":104300,"game_id":null,"phase":"idle","schema":1,"seq":17,"ts":1800000104300,"type":"state"}
+{"at":105000,"game_id":null,"phase":"connecting","schema":1,"seq":18,"ts":1800000105000,"type":"state"}
+{"at":105200,"game_id":null,"phase":"waiting_pairing","schema":1,"seq":19,"ts":1800000105200,"type":"state"}
+{"at":110023,"entering_king_rule":"CSARule27","game_id":"test+floodgate-300-10F+them2+us+20260807123000","initial_sfen":"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1","max_moves":256,"moves_so_far":[],"my_color":"white","names":{"black":"them2","white":"us"},"schema":1,"seq":20,"time":{"byoyomi_ms":0,"inc_ms":10000,"least_ms":0,"roundup":false,"total_ms":300000,"unit_ms":1000},"ts":1800000110023,"type":"game_start"}
+{"at":110023,"game_id":"test+floodgate-300-10F+them2+us+20260807123000","phase":"agreed","schema":1,"seq":21,"ts":1800000110023,"type":"state"}
+{"at":111000,"game_id":"test+floodgate-300-10F+them2+us+20260807123000","phase":"playing","schema":1,"seq":22,"ts":1800000111000,"type":"state"}
+{"at":112000,"black_remaining_ms":308000,"by":"opponent","csa":"+7776FU","eval":null,"game_id":"test+floodgate-300-10F+them2+us+20260807123000","ply":1,"schema":1,"seq":23,"side":"black","t_ms":2000,"ts":1800000112000,"type":"move","usi":"7g7f","white_remaining_ms":300000}
+{"at":112000,"deadline_at":419499,"game_id":"test+floodgate-300-10F+them2+us+20260807123000","ply":1,"schema":1,"seq":24,"times":{"binc_ms":10000,"btime_ms":308000,"byoyomi_ms":null,"winc_ms":10000,"wtime_ms":297500},"ts":1800000112000,"type":"go"}
+{"at":113100,"black_remaining_ms":308000,"by":"engine","csa":"-3334FU","eval":{"cp":null,"depth":null,"mate":null,"nodes":null,"pv_usi":[]},"game_id":"test+floodgate-300-10F+them2+us+20260807123000","ply":2,"schema":1,"seq":25,"side":"white","t_ms":3000,"ts":1800000113100,"type":"move","usi":"3c3d","white_remaining_ms":307000}
+{"at":111500,"code":"unreadable_engine_line","detail":"still not usi","game_id":"test+floodgate-300-10F+them2+us+20260807123000","level":"warn","schema":1,"seq":26,"ts":1800000111500,"type":"alert"}
+{"at":114200,"black_remaining_ms":308000,"game_id":"test+floodgate-300-10F+them2+us+20260807123000","result":"win","schema":1,"seq":27,"terminal":["%TORYO","#RESIGN","#WIN"],"ts":1800000114200,"type":"game_end","white_remaining_ms":307000}
+{"at":114200,"game_id":null,"phase":"idle","schema":1,"seq":28,"ts":1800000114200,"type":"state"}
+{"at":114200,"game_id":null,"phase":"closing","schema":1,"seq":29,"ts":1800000114200,"type":"state"}
+{"at":114200,"game_id":null,"schema":1,"seq":30,"ts":1800000114200,"type":"bridge_stop"}

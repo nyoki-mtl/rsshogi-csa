@@ -1,0 +1,27 @@
+BEGIN Game_Summary
+Protocol_Version:1.2
+Protocol_Mode:Server
+Format:Shogi 1.0
+Declaration:Jishogi 1.1
+Game_ID:wdoor+floodgate-900-0+black_engine+white_engine+20260804120000
+Name+:black_engine
+Name-:white_engine
+Rematch_On_Draw:NO
+To_Move:+
+Max_Moves:256
+BEGIN Time
+Time_Unit:1sec
+Total_Time:900
+Byoyomi:0
+Increment:0
+Least_Time_Per_Move:0
+Remaining_Time+:874
+Remaining_Time-:889
+Last_Move:+7776FU,T12
+Current_Turn:3
+END Time
+BEGIN Position
+PI
++
+END Position
+END Game_Summary

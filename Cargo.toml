@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "crates/rsshogi-csa",
+    "crates/rsshogi-csa-bridge",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+authors = ["rsshogi contributors"]

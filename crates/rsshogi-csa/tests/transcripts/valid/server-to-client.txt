@@ -1,0 +1,62 @@
+; Lines a server sends. Wire strings follow shogi_server/game.rb, game_result.rb,
+; command.rb and the shogi-server main script.
+
+; Login.
+LOGIN:engine OK
+LOGIN:incorrect
+LOGOUT:completed
+CHALLENGE ACCEPTED
+
+; The proposal opens with this line; the rest of the block goes to GameSummaryReader.
+BEGIN Game_Summary
+
+; Start and rejection notices.
+START:wdoor+floodgate-900-0+black+white+20260804120000
+REJECT:wdoor+floodgate-900-0+black+white+20260804120000 by white
+REJECT:wdoor+floodgate-900-0+black+white+20260804120000 by the Server (timed out)
+
+; Move echoes always carry the server-measured elapsed time.
++7776FU,T12
+-3334FU,T0
++2726FU,T1234
+
+; Special move echoes may carry a time as well.
+%TORYO,T20
+%KACHI,T3
+
+; Terminal bursts. Reason first, then outcome.
+#RESIGN
+#WIN
+#LOSE
+#DRAW
+#CENSORED
+#TIME_UP
+#JISHOGI
+#ILLEGAL_MOVE
+#ILLEGAL_ACTION
+#SENNICHITE
+#OUTE_SENNICHITE
+#MAX_MOVES
+#CHUDAN
+
+; A marker this crate has never seen still round-trips.
+#FUTURE_REASON
+
+; Informational lines.
+##[WHO] engine CSA game floodgate-900-0 *
+##[WHO] +OK
+##[LIST] wdoor+floodgate-900-0+black+white+20260804120000
+##[LIST] +OK
+##[RATING] engine 3000 @2026-08-04
+##[RATING] +OK
+##[VERSION] Shogi Server revision 20260804
+##[VERSION] +OK
+##[HELP] available commands "%%WHO", "%%CHAT str", "%%GAME game_name +", "%%GAME game_name -"
+##[LOGIN] +OK x1
+##[CHAT][black] hello
+##[MONITOR][game-1] +OK
+##[GETBUOYCOUNT] -1
+##[FORK]: new buoy game name: buoy_x-900-0
+##[ERROR] unknown command: NOPE
+##[ERROR] bad game name: bogus.
+##[ERROR] can't find rival for test-1500-0

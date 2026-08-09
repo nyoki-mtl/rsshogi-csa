@@ -1,0 +1,66 @@
+; Lines parse_line must reject outright.
+
+; Not a command at all.
+NOPE
+hello world
+login engine secret
+agree
+
+; Missing required arguments.
+LOGIN
+LOGIN engine
+%%CHALLENGE only-a-name
+%%SHOW
+%%CHAT
+START:
+
+; Arguments that do not belong.
+LOGIN engine secret x2
+LOGIN engine secret x1 extra
+LOGOUT now
+AGREE game-1 extra
+%%WHO extra
+%%LIST extra
+%%GAME name x
+%%GAME name ++
+
+; Malformed server responses.
+LOGIN: OK
+LOGIN:engine NG
+LOGOUT:aborted
+REJECT:game-1
+REJECT:game-1 by
+REJECT: by white
+
+; Malformed moves.
++7776
++7776F
++7776FUU
++77a6FU
++7776fu
++7776XX
+-3334ZZ
++7776FU,
++7776FU,T
++7776FU,Tx
++7776FU,X12
++7776FU,T12,X
+
+; A bare side-to-move marker is only meaningful inside a Position block.
++
+-
+
+; Malformed special and info lines.
+%
+##[NOBRACKET
+##[TAG
+
+; Game_Summary body lines are not top-level commands.
+Protocol_Version:1.2
+Name+:engine
+Your_Turn:+
+BEGIN Time
+BEGIN Position
+END Game_Summary
+P1-KY-KE-GI-KI-OU-KI-GI-KE-KY
+PI

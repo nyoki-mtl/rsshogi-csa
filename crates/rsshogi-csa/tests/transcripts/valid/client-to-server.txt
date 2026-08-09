@@ -1,0 +1,54 @@
+; Lines a client sends. Wire strings follow shogi_server/command.rb and login.rb.
+
+; Login. In CSA mode the password field also carries the game name.
+LOGIN engine secret
+LOGIN engine floodgate-900-0,secret
+LOGIN engine floodgate-600-10F,secret
+LOGIN engine test-1500-0-B,secret
+LOGIN engine secret x1
+LOGOUT
+
+; Game proposal handshake.
+AGREE
+AGREE wdoor+floodgate-900-0+black+white+20260804120000
+REJECT
+REJECT wdoor+floodgate-900-0+black+white+20260804120000
+
+; Legacy no-op the server answers with CHALLENGE ACCEPTED.
+CHALLENGE
+
+; Moves. Floodgate carries evaluation and pv in the comment field.
++7776FU
+-3334FU
++0055KA
+-8384FU,'* 60 +2625FU -8485FU +6978KI
++2726FU,'* -123
+
+; Special moves.
+%TORYO
+%KACHI
+%CHUDAN
+
+; Administrative commands used in x1 mode and for local testing.
+%%GAME
+%%GAME floodgate-900-0 *
+%%GAME test-1500-0 +
+%%GAME test-1500-0 -
+%%CHALLENGE test-1500-0 +
+%%WHO
+%%LIST
+%%SHOW wdoor+floodgate-900-0+black+white+20260804120000
+%%CHAT hello world
+%%RATING
+%%VERSION
+%%HELP
+
+; Commands this crate does not type still round-trip verbatim.
+%%SETBUOY buoy_test-1500-0 +7776FUT2 3
+%%DELETEBUOY buoy_test-1500-0
+%%GETBUOYCOUNT buoy_test-1500-0
+%%FORK wdoor+floodgate-900-0+black+white+20260804120000 buoy_x-900-0 40
+%%MONITORON wdoor+floodgate-900-0+black+white+20260804120000
+%%MONITOROFF wdoor+floodgate-900-0+black+white+20260804120000
+%%MONITOR2ON wdoor+floodgate-900-0+black+white+20260804120000
+%%%81DOJO_EXTENSION

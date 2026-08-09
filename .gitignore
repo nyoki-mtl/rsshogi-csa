@@ -1,0 +1,30 @@
+# Rust
+/target
+**/target
+debug
+docs/book/build/
+**/*.rs.bk
+*.pdb
+
+# Runtime artifacts produced by the bridge.
+# The wire log carries the login line, so the whole directory stays out of git.
+logs/
+*.jsonl
+!fixtures/csa-event-log-contract.jsonl
+*.csa
+!crates/*/tests/**/*.csa
+
+# Local notes and credentials, never committed.
+local/
+
+
+# Local tooling
+.kiro/
+.serena/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
