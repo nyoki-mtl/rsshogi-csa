@@ -1,0 +1,108 @@
+name: rust-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published crate version to reconcile
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  publish-crate:
+    if: github.repository == 'nyoki-mtl/rsshogi-csa' && github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Validate tag and crate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag_version="${GITHUB_REF_NAME#v}"
+          crate_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/rsshogi-csa/Cargo.toml | head -n1)"
+          if [ -z "${crate_version}" ]; then
+            echo "Failed to read version from crates/rsshogi-csa/Cargo.toml"
+            exit 1
+          fi
+          if [ "${tag_version}" != "${crate_version}" ]; then
+            echo "Tag version (${tag_version}) does not match crate version (${crate_version})"
+            exit 1
+          fi
+          echo "CRATE_VERSION=${crate_version}" >> "${GITHUB_ENV}"
+
+      - name: Check whether version already exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          status="$(curl -A "rsshogi-csa-release-workflow (https://github.com/nyoki-mtl/rsshogi-csa)" \
+            -sS -o /tmp/crates-io-version.json -w '%{http_code}' \
+            "https://crates.io/api/v1/crates/rsshogi-csa/${CRATE_VERSION}")"
+          case "${status}" in
+            200)
+              echo "rsshogi-csa ${CRATE_VERSION} already exists on crates.io; skipping publish."
+              echo "SKIP_PUBLISH=1" >> "${GITHUB_ENV}"
+              ;;
+            404)
+              echo "SKIP_PUBLISH=0" >> "${GITHUB_ENV}"
+              ;;
+            *)
+              echo "crates.io version check returned HTTP ${status}"
+              cat /tmp/crates-io-version.json
+              exit 1
+              ;;
+          esac
+
+      - name: Verify package
+        if: env.SKIP_PUBLISH == '0'
+        run: cargo publish -p rsshogi-csa --dry-run
+
+      - name: Authenticate with crates.io
+        if: env.SKIP_PUBLISH == '0'
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1
+
+      - name: Publish to crates.io
+        if: env.SKIP_PUBLISH == '0'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
+        run: cargo publish -p rsshogi-csa
+
+  reconcile-deployment:
+    if: github.repository == 'nyoki-mtl/rsshogi-csa' && github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+    steps:
+      - name: Verify published crate
+        shell: bash
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          payload="$(curl -A "rsshogi-csa-release-workflow (https://github.com/nyoki-mtl/rsshogi-csa)" \
+            -fsS "https://crates.io/api/v1/crates/rsshogi-csa/${RELEASE_VERSION}")"
+          jq -e --arg version "${RELEASE_VERSION}" '
+            .version.crate == "rsshogi-csa"
+            and .version.num == $version
+            and .version.yanked == false
+          ' <<<"${payload}" >/dev/null
+          echo "Verified rsshogi-csa ${RELEASE_VERSION} on crates.io."

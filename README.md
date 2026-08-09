@@ -5,7 +5,7 @@ CSA プロトコルサーバーと CUI だけで対局するための Rust works
 floodgateのようなヘッドレス環境で、
 GUI やブリッジ用 GUI を挟まずに USI エンジンを直接参加させることを目的にしています。
 
-## 0.1.0 の対応範囲
+## 0.1.1 の対応範囲
 
 | 対象 | 状態 |
 | --- | --- |
@@ -14,8 +14,8 @@ GUI やブリッジ用 GUI を挟まずに USI エンジンを直接参加させ
 | 世界コンピュータ将棋選手権、電竜戦 | experimental |
 | buoy、駒落ち | experimental |
 
-experimentalは実装経路またはcodecを含みますが、0.1.0の相互運用保証には含みません。
-時間無制限の対局条件はUSIへ安全に写せないため、0.1.0では`REJECT`します。
+experimentalは実装経路またはcodecを含みますが、0.1.1の相互運用保証には含みません。
+時間無制限の対局条件はUSIへ安全に写せないため、0.1.1では`REJECT`します。
 
 ## Crates
 
@@ -27,6 +27,11 @@ experimentalは実装経路またはcodecを含みますが、0.1.0の相互運�
 ## `rsshogi-csa`
 
 CSA プロトコルの 1 行を型付きの `CsaCommand` に相互変換します。
+
+```toml
+[dependencies]
+rsshogi-csa = "0.1.1"
+```
 
 - runtime dependency はありません
 - I/O も盤面も持ちません。socket も時計も上位層の責務です
@@ -168,8 +173,8 @@ ssh -N -L 7777:127.0.0.1:7777 user@your-instance
 
 ## 配布物
 
-0.1.0はGitHubのsource archiveとWindows x86_64向けbinaryを配布します。
-両crateは`publish = false`で、crates.ioへは公開しません。
+`rsshogi-csa` codecはcrates.ioとGitHub source archiveで配布します。
+`rsshogi-csa-bridge`はcrates.ioへ公開せず、Windows x86_64向けbinaryをGitHub Releaseで配布します。
 
 tag `v*` のrelease workflowは次の2ファイルを生成します。
 

@@ -1,15 +1,16 @@
 [package]
 name = "rsshogi-csa"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.95"
 description = "Engine-agnostic CSA shogi server protocol command model, parser, and formatter"
 license = "MIT"
 repository = "https://github.com/nyoki-mtl/rsshogi-csa"
+homepage = "https://github.com/nyoki-mtl/rsshogi-csa"
+documentation = "https://docs.rs/rsshogi-csa"
 readme = "../../README.md"
 keywords = ["shogi", "csa", "protocol", "floodgate"]
 categories = ["parser-implementations", "games"]
-publish = false
 
 [lib]
 name = "rsshogi_csa"

@@ -5,6 +5,17 @@
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-08-09
+
+### Added
+
+- 依存ゼロの`rsshogi-csa` codecをcrates.ioから利用できるようにした
+- crates.io Trusted Publishingによるtag駆動のrelease workflowを追加した
+
+### Changed
+
+- `rsshogi-csa`と`rsshogi-csa-bridge`のversionを0.1.1へ更新した
+
 ## [0.1.0] - 2026-08-09
 
 ### Added
