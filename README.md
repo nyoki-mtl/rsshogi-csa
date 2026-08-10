@@ -21,6 +21,21 @@ cargo run -p rsshogi-csa-bridge --release --bin csabridge -- --name myengine --p
 
 `myengine`、`secret`、エンジンのパスは利用する環境に合わせて置き換えてください。
 
+## ShogiArena で観戦する
+
+bridge が `logs` に書くイベントログは、[ShogiArena](https://github.com/nyoki-mtl/ShogiArena) 1.2.6 以降で観戦できます。
+
+bridge とは別のターミナルで ShogiArena をインストールし、同じログディレクトリを指定します。
+
+```powershell
+python -m pip install --upgrade 'shogiarena>=1.2.6'
+shogiarena dashboard watch --csa-log-dir .\logs --port 7777
+```
+
+コマンドが表示した URL をブラウザで開くと、進行中の盤面、対局一覧、bridge の稼働状態を確認できます。
+
+複数の bridge をまとめて監視する方法と、停止後に対局を再表示する方法は、[ShogiArena で対局を観戦する](https://nyoki-mtl.github.io/rsshogi-csa/bridge/shogiarena.html)を参照してください。
+
 ## ドキュメント
 
 - **[ガイド / mdBook](https://nyoki-mtl.github.io/rsshogi-csa/)**：workspace の目的と各 crate の役割
