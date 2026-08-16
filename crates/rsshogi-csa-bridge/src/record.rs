@@ -93,6 +93,8 @@ pub enum AlertCode {
     LoginFailed,
     /// The proposal could not be turned into a playable game.
     UnusableProposal,
+    /// The configured safety margin leaves no time for the engine to search.
+    MarginExhaustsBudget,
     /// The move the engine offered to ponder on failed the legality gate.
     UnusablePonder,
 }
@@ -395,6 +397,9 @@ mod tests {
     fn alert_codes_are_snake_case_on_the_wire() {
         let json = serde_json::to_string(&AlertCode::SuspectResign).expect("code should serialize");
         assert_eq!(json, r#""suspect_resign""#);
+        let json =
+            serde_json::to_string(&AlertCode::MarginExhaustsBudget).expect("code should serialize");
+        assert_eq!(json, r#""margin_exhausts_budget""#);
     }
 
     /// One line per record type, in the exact form the writer emits: the shell

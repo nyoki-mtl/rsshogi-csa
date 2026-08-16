@@ -246,11 +246,11 @@ dependencies = [
 
 [[package]]
 name = "rsshogi-csa"
-version = "0.1.2"
+version = "0.1.3"
 
 [[package]]
 name = "rsshogi-csa-bridge"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "clap",
  "rsshogi",

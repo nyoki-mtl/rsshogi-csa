@@ -9,6 +9,7 @@ docs/book/build/
 # Runtime artifacts produced by the bridge.
 # The wire log carries the login line, so the whole directory stays out of git.
 logs/
+logs-v*/
 *.jsonl
 !fixtures/csa-event-log-contract.jsonl
 *.csa

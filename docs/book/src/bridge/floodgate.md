@@ -42,6 +42,14 @@ engine executable の場所と作業ディレクトリが違うときは、`--en
 
 引数を必要とする engine には、`--engine-arg VALUE` を引数ごとに繰り返します。
 
+## 評価値の視点
+
+USIの`info score`はengine側視点で、engine有利が正です。
+
+Floodgateへ送るCSA score commentは先手固定視点へ変換し、先手有利を正、後手有利を負にします。
+
+event JSONLのevalは、resign判定やengine logと同じUSIのengine側視点を維持します。
+
 ## 複数局を続ける
 
 `--games` の既定値は `1` です。

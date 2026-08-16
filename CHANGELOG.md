@@ -5,6 +5,21 @@
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-08-17
+
+### Added
+
+- `--margin-ms`がその手の探索予算を使い切るproposalへ
+  `margin_exhausts_budget` alertを記録するようにした
+- 電竜戦の`T602`持時間ハンデを含むFischer対局の回帰テストと運用文書を追加した
+
+### Fixed
+
+- 後手エンジンのUSI scoreをFloodgate向けCSA commentへ載せる際、
+  固定先手視点への符号変換が抜けていた問題を修正した
+- cpとmateのCSA commentだけを先手固定視点へ変換し、event eval、engine log、
+  resign判定、PVは従来どおりエンジン側視点を維持する
+
 ## [0.1.2] - 2026-08-09
 
 ### Fixed

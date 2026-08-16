@@ -20,7 +20,14 @@ CSA の increment は着手前に加算されます。
 
 USI へ渡す increment は着手後の規約なので、bridge は表現を変換してから `go` に載せます。
 
+指定局面や中断再開で`BEGIN Position`に着手履歴が含まれる場合も、各手の`,T`を
+対局中のechoと同じ規則で台帳へ適用します。`T`とincrementが同値なら残り時間は変わらず、
+incrementを超える`T`はその側の残り時間を減らします。電竜戦の持時間ハンデはこの性質を使うため、
+着手履歴の`T`を読み飛ばしてはいけません。[^denryu-handicap]
+
 [^server-time]: [CSA サーバプロトコル ver.1.2.1: 持時間と着手時刻](https://www.computer-shogi.org/protocol/tcp_ip_server_121.html)
+
+[^denryu-handicap]: [指定局面とフィッシャー加算、持ち時間ハンデの調査](https://zenn.dev/keiishida/articles/denryu-buoy-increment-time)
 
 ## 送ってよい行を限定する
 

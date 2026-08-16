@@ -959,6 +959,16 @@ impl SessionCore {
 
         self.game_id.clone_from(&summary.game_id);
         self.entering_king_rule = Some(rule);
+        match game.ledger().budget_ms(game.our_color()) {
+            Some(budget_ms) if budget_ms <= self.config.margin_ms => {
+                let detail = format!(
+                    "--margin-ms {} consumes our {budget_ms} ms move budget; search deadline will be immediate",
+                    self.config.margin_ms
+                );
+                self.alert(at, AlertLevel::Warn, AlertCode::MarginExhaustsBudget, &detail, out);
+            }
+            Some(_) | None => {}
+        }
         out.push(Action::SendEngine(UsiCommand::SetOption {
             name: "EnteringKingRule".to_owned(),
             value: Some(usi_entering_king_rule(rule).to_owned()),
@@ -1485,6 +1495,9 @@ impl SessionCore {
 
     /// The `,'* <score> <pv...>` floodgate records against a move.
     ///
+    /// The score is fixed to Black's perspective here; [`SearchInfo`] remains
+    /// in the engine's perspective for records and decisions.
+    ///
     /// The variation is spelled from the board after `csa`, so it reads as the
     /// continuation rather than repeating the move it hangs off.
     fn move_comment(&self, csa: &str) -> Option<String> {
@@ -1492,6 +1505,10 @@ impl SessionCore {
             return None;
         }
         let score = self.info.comment_score()?;
+        let score = match self.game.as_ref()?.our_color() {
+            Color::Black => score,
+            Color::White => score.checked_neg()?,
+        };
         let mut comment = format!("* {score}");
         if self.config.pv_comment_moves > 0 {
             if let Some(game) = &self.game {

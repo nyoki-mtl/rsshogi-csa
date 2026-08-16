@@ -64,6 +64,18 @@
 | `--any-legal-on-panic` | off | fallback が尽きたとき投了でなく任意の合法手を指す |
 | `--quit-grace-secs N` | `6` | `quit` 後に engine の終了を待つ時間 |
 
+### 持時間0秒のFischer対局
+
+`--margin-ms`は、その手で実際に使える時間より小さくする必要があります。
+
+たとえば`Time_Unit:1sec`、`Increment:2`で残り持時間が0秒なら、時間切れにならずに
+記録できる消費時間は1秒までで、実時間の上限は1999msです。
+既定の`--margin-ms 2500`では探索時間が残らず、engineへの`binc`も0になります。
+
+この形式の大会では`--margin-ms`を2000未満に設定し、実際の接続先、network、engineで
+余裕を確認してください。bridgeはmarginがその手の全予算を消費すると
+`margin_exhausts_budget` alertを記録します。
+
 `--resign-cp` は投了の可否を変えません。
 
 engine が出した `bestmove resign` は送信し、score が説明しない場合だけ記録に alert を残します。

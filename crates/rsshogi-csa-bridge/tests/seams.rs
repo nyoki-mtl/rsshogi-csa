@@ -37,6 +37,32 @@ PI
 END Position
 END Game_Summary";
 
+const WHITE_PROPOSAL: &str = "\
+BEGIN Game_Summary
+Protocol_Version:1.2
+Protocol_Mode:Server
+Format:Shogi 1.0
+Declaration:Jishogi 1.1
+Game_ID:test+floodgate-900-0+them+us+20260804120000
+Name+:them
+Name-:us
+Your_Turn:-
+Rematch_On_Draw:NO
+To_Move:+
+Max_Moves:256
+BEGIN Time
+Time_Unit:1sec
+Total_Time:900
+Byoyomi:0
+Increment:0
+Least_Time_Per_Move:0
+END Time
+BEGIN Position
+PI
++
+END Position
+END Game_Summary";
+
 const RESUMED_PROPOSAL: &str = "\
 BEGIN Game_Summary
 Protocol_Version:1.2
@@ -64,6 +90,36 @@ PI
 -3334FU,T22
 +2726FU,T58
 -4132KI,T30
+END Position
+END Game_Summary";
+
+const DENRYU_ZERO_TIME_PROPOSAL: &str = "\
+BEGIN Game_Summary
+Protocol_Version:1.2
+Protocol_Mode:Server
+Format:Shogi 1.0
+Declaration:Jishogi 1.1
+Game_ID:dr7tsec+buoy_blackbid600_tsec7t1-1-bottom_4_tmoq_hatena-600-2F+tmoq+hatena+20260606221756
+Name+:us
+Name-:them
+Your_Turn:+
+Rematch_On_Draw:NO
+To_Move:+
+Max_Moves:512
+BEGIN Time
+Time_Unit:1sec
+Total_Time:600
+Byoyomi:0
+Increment:2
+Least_Time_Per_Move:0
+END Time
+BEGIN Position
+PI
++
++5958OU,T602
+-5152OU,T2
++5859OU,T2
+-5251OU,T2
 END Position
 END Game_Summary";
 
@@ -454,6 +510,72 @@ fn a_mate_score_still_reaches_the_record() {
 }
 
 #[test]
+fn a_black_centipawn_comment_keeps_the_engine_score() {
+    let mut harness = Harness::new(config());
+    harness.start_game(PROPOSAL);
+
+    harness.engine(100, "info score cp -30");
+    let answered = harness.engine(200, "bestmove 7g7f");
+
+    assert_eq!(server_lines(&answered), ["+7776FU,'* -30"]);
+}
+
+#[test]
+fn white_centipawn_comments_use_the_fixed_black_perspective() {
+    for (engine_score, csa_score) in [(-30, 30), (45, -45)] {
+        let mut harness = Harness::new(config());
+        harness.start_game(WHITE_PROPOSAL);
+        harness.server(80, "+7776FU,T1");
+
+        harness.engine(100, &format!("info score cp {engine_score}"));
+        let answered = harness.engine(200, "bestmove 3c3d");
+
+        assert_eq!(server_lines(&answered), [format!("-3334FU,'* {csa_score}")]);
+    }
+}
+
+#[test]
+fn white_mate_comments_use_the_fixed_black_perspective() {
+    for (engine_score, csa_score) in [(1, -31_999), (-2, 31_998)] {
+        let mut harness = Harness::new(config());
+        harness.start_game(WHITE_PROPOSAL);
+        harness.server(80, "+7776FU,T1");
+
+        harness.engine(100, &format!("info score mate {engine_score}"));
+        let answered = harness.engine(200, "bestmove 3c3d");
+
+        assert_eq!(server_lines(&answered), [format!("-3334FU,'* {csa_score}")]);
+    }
+}
+
+#[test]
+fn white_eval_records_and_resign_checks_keep_the_engine_perspective() {
+    let mut harness = Harness::new(config());
+    harness.start_game(WHITE_PROPOSAL);
+    harness.server(80, "+7776FU,T1");
+    harness.engine(100, "info score cp -500");
+
+    let answered = harness.engine(200, "bestmove 3c3d");
+    assert_eq!(server_lines(&answered), ["-3334FU,'* 500"]);
+    harness.server(300, "-3334FU,T1");
+
+    let eval = harness.records().into_iter().find_map(|body| match body {
+        RecordBody::Move(record) if record.side == Side::White => record.eval,
+        _ => None,
+    });
+    assert_eq!(eval.expect("white move should carry its engine eval").cp, Some(-500));
+
+    let mut resigning = Harness::new(config());
+    resigning.start_game(WHITE_PROPOSAL);
+    resigning.server(80, "+7776FU,T1");
+    resigning.engine(100, "info score cp -500");
+    let resigned = resigning.engine(200, "bestmove resign");
+
+    assert_eq!(server_lines(&resigned), ["%TORYO"]);
+    assert!(!resigning.alerts().contains(&AlertCode::SuspectResign));
+}
+
+#[test]
 fn an_illegal_bestmove_never_reaches_the_socket() {
     let mut harness = Harness::new(config());
     harness.start_game(PROPOSAL);
@@ -517,6 +639,58 @@ fn a_resumed_game_replays_into_the_right_clock_and_turn() {
         .find(|line| line.starts_with("position"))
         .expect("the engine is told the position");
     assert!(position.ends_with(" moves 7g7f 3c3d 2g2f 4a3b"), "{position}");
+}
+
+#[test]
+fn denryu_zero_time_buoy_replays_t602_and_starts_with_the_increment() {
+    let mut config = config();
+    config.margin_ms = 500;
+    let mut harness = Harness::new(config);
+    harness.feed(Event::Started { at: 0 });
+    harness.engine(10, "usiok");
+    harness.engine(20, "readyok");
+    harness.feed(Event::Connected { at: 30 });
+    harness.server(40, "LOGIN:us OK");
+    harness.summary(50, DENRYU_ZERO_TIME_PROPOSAL);
+    let started = harness.server(
+        60,
+        "START:dr7tsec+buoy_blackbid600_tsec7t1-1-bottom_4_tmoq_hatena-600-2F+tmoq+hatena+20260606221756",
+    );
+
+    let moves = harness
+        .records()
+        .into_iter()
+        .find_map(|body| match body {
+            RecordBody::GameStart { moves_so_far, .. } => Some(moves_so_far),
+            _ => None,
+        })
+        .expect("the proposal should be recorded");
+    assert_eq!(moves.len(), 4);
+    assert_eq!(moves[0].t_ms, 602_000);
+    assert_eq!(moves[0].black_remaining_ms, 0);
+    assert_eq!(moves[0].white_remaining_ms, 600_000);
+    assert_eq!(moves[3].black_remaining_ms, 0);
+    assert_eq!(moves[3].white_remaining_ms, 600_000);
+
+    assert_eq!(go_line(&started).as_deref(), Some("go btime 0 wtime 600000 binc 1500 winc 2000"));
+    let deadline = harness
+        .records()
+        .into_iter()
+        .find_map(|body| match body {
+            RecordBody::Go { deadline_at, .. } => Some(deadline_at),
+            _ => None,
+        })
+        .expect("our turn should start a search");
+    assert_eq!(deadline, 1_559);
+    assert!(!harness.alerts().contains(&AlertCode::MarginExhaustsBudget));
+}
+
+#[test]
+fn denryu_zero_time_buoy_warns_when_the_default_margin_consumes_the_increment() {
+    let mut harness = waiting_harness();
+    harness.summary(50, DENRYU_ZERO_TIME_PROPOSAL);
+
+    assert!(harness.alerts().contains(&AlertCode::MarginExhaustsBudget));
 }
 
 #[test]
