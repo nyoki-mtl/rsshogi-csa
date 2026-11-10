@@ -254,13 +254,9 @@ impl SearchInfo {
 
     fn is_losing(&self, threshold_cp: i32) -> bool {
         if let Some(mate) = self.mate {
-            return mate < 0;
+            return mate <= 0;
         }
         self.cp.is_some_and(|cp| cp <= threshold_cp)
-    }
-
-    const fn has_score(&self) -> bool {
-        self.cp.is_some() || self.mate.is_some()
     }
 
     /// The score a move comment carries, with mate folded onto the centipawn scale.
@@ -282,7 +278,7 @@ impl SearchInfo {
         } else {
             MATE_SCORE.saturating_sub(mate.saturating_abs()).max(0)
         };
-        Some(if mate >= 0 { magnitude } else { -magnitude })
+        Some(if mate > 0 { magnitude } else { -magnitude })
     }
 
     fn to_record(&self) -> EvalRecord {
@@ -832,7 +828,7 @@ impl SessionCore {
                 // whatever the search said. A resign the score does not explain
                 // is worth finding in the log afterwards; substituting our own
                 // move for it would only be a guess dressed as a rescue.
-                if !self.info.has_score() || !self.info.is_losing(self.config.resign_threshold_cp) {
+                if !self.info.is_losing(self.config.resign_threshold_cp) && game.has_legal_moves() {
                     self.alert(
                         at,
                         AlertLevel::Error,
@@ -2119,6 +2115,7 @@ mod tests {
         // the game was decided.
         assert_eq!(mate(1).comment_score(), Some(MATE_SCORE - 1));
         assert_eq!(mate(-2).comment_score(), Some(-(MATE_SCORE - 2)));
+        assert_eq!(mate(0).comment_score(), Some(-MATE_SCORE));
 
         // A win or loss at an unstated distance is as strong as the scale goes.
         assert_eq!(mate(i32::MAX).comment_score(), Some(MATE_SCORE));

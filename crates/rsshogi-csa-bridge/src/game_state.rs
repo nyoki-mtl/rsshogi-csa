@@ -393,6 +393,17 @@ impl GameState {
         }
     }
 
+    /// Whether the side to move has any legal move, independently of engine scores.
+    ///
+    /// Having no legal move justifies resignation even without a score. This
+    /// does not by itself distinguish checkmate from a position without check.
+    #[must_use]
+    pub fn has_legal_moves(&self) -> bool {
+        let mut list = Move32List::new();
+        generate_legal_all_move32(&self.position, &mut list);
+        !list.is_empty()
+    }
+
     /// Any legal move, spelled for the wire.
     ///
     /// Only the panic branch of the fallback ladder uses this, and only when the

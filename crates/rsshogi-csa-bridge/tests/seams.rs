@@ -706,6 +706,91 @@ fn a_second_consecutive_hang_resigns() {
 // Seam 4: telling a real resignation from a wedged GPU.
 // ---------------------------------------------------------------------------
 
+fn proposal_from_sfen(sfen: &str, turn: char) -> String {
+    let position = rsshogi::board::position_from_sfen(sfen).unwrap();
+    let prefix = PROPOSAL
+        .split_once("BEGIN Position")
+        .unwrap()
+        .0
+        .replace("Your_Turn:+", &format!("Your_Turn:{turn}"))
+        .replace("To_Move:+", &format!("To_Move:{turn}"));
+    format!(
+        "{prefix}BEGIN Position\n{}\nEND Position\nEND Game_Summary",
+        rsshogi::records::formats::csa::board_to_csa(&position)
+    )
+}
+
+#[test]
+fn mate_zero_justifies_resignation_even_with_legal_moves() {
+    for (summary, white) in [(PROPOSAL, false), (WHITE_PROPOSAL, true)] {
+        let mut harness = Harness::new(config());
+        harness.start_game(summary);
+        if white {
+            harness.server(80, "+7776FU,T1");
+        }
+        harness.engine(100, "info score mate 0");
+        assert_eq!(server_lines(&harness.engine(200, "bestmove resign")), ["%TORYO"]);
+        assert!(!harness.alerts().contains(&AlertCode::SuspectResign));
+    }
+}
+
+#[test]
+fn no_legal_moves_justify_resignation_with_or_without_a_score() {
+    for (sfen, turn, checked) in [
+        ("8k/7G1/7K1/9/9/9/9/9/9 w - 1", '-', true),
+        ("9/9/9/9/9/9/7k1/7g1/8K b - 1", '+', true),
+        ("8k/6G2/7KP/9/9/9/9/9/9 w - 1", '-', false),
+    ] {
+        let position = rsshogi::board::position_from_sfen(sfen).unwrap();
+        assert_eq!(position.is_in_check(), checked);
+        let mut moves = rsshogi::board::Move32List::new();
+        rsshogi::board::movegen::generate_legal_all_move32(&position, &mut moves);
+        assert!(moves.is_empty(), "fixture must have no legal move: {sfen}");
+        for info in [None, Some("info score mate 0"), Some("info score cp 500")] {
+            let mut harness = Harness::new(config());
+            harness.start_game(&proposal_from_sfen(sfen, turn));
+            if let Some(line) = info {
+                harness.engine(100, line);
+            }
+            let actions = harness.engine(200, "bestmove resign");
+            assert_eq!(server_lines(&actions), ["%TORYO"], "resign has no score comment");
+            assert!(!harness.alerts().contains(&AlertCode::SuspectResign), "{sfen}, {info:?}");
+            assert!(!harness.records().iter().any(|body| matches!(
+                body,
+                RecordBody::Alert { level: rsshogi_csa_bridge::AlertLevel::Error, .. }
+            )));
+        }
+    }
+}
+
+#[test]
+fn mate_zero_comments_use_fixed_black_perspective_without_changing_raw_eval() {
+    for white in [false, true] {
+        let mut harness = Harness::new(config());
+        harness.start_game(if white { WHITE_PROPOSAL } else { PROPOSAL });
+        if white {
+            harness.server(80, "+7776FU,T1");
+        }
+        harness.engine(100, "info score mate 0");
+        let (usi, csa, score) =
+            if white { ("3c3d", "-3334FU", 32000) } else { ("7g7f", "+7776FU", -32000) };
+        assert_eq!(
+            server_lines(&harness.engine(200, &format!("bestmove {usi}"))),
+            [format!("{csa},'* {score}")]
+        );
+        harness.server(300, &format!("{csa},T1"));
+        let eval = harness
+            .records()
+            .into_iter()
+            .find_map(|body| match body {
+                RecordBody::Move(record) if record.eval.is_some() => record.eval,
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(eval.mate, Some(0));
+    }
+}
+
 #[test]
 fn a_resign_without_a_score_is_passed_on_and_reported() {
     let mut harness = Harness::new(config());
