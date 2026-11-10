@@ -54,6 +54,7 @@ async fn shutdown_finishes_while_server_keeps_socket_open() {
     let mut config = BridgeConfig::floodgate("us", "shutdown-10-5,secret");
     config.games = 1;
     config.margin_ms = 500;
+    config.stop_grace_ms = 400;
 
     let engine_path = std::env::current_exe().expect("current test executable");
     let core = SessionCore::new(config, engine_path.display().to_string(), "test");
@@ -99,6 +100,92 @@ async fn shutdown_finishes_while_server_keeps_socket_open() {
     server.abort();
     let _ = server.await;
     let _ = tokio::fs::remove_dir_all(&log_dir).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn two_games_require_registration_only_for_explicit_x1() {
+    for (x1, explicit, eof) in
+        [(true, true, false), (true, false, false), (false, false, false), (false, false, true)]
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let log_dir = std::env::temp_dir().join(format!("rsshogi-csa-two-games-{}", addr.port()));
+        let server = tokio::spawn(async move {
+            let mut connection = None;
+            for game in 0..2 {
+                if connection.is_none() {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    stream.set_nodelay(true).unwrap();
+                    let (read, write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    assert!(next_nonempty(&mut lines).await.starts_with("LOGIN us "));
+                    let mut write = write;
+                    send(&mut write, "LOGIN:us OK").await;
+                    connection = Some((lines, write));
+                }
+                let (lines, write) = connection.as_mut().unwrap();
+                if explicit {
+                    assert_eq!(next_nonempty(lines).await, "%%GAME audit *");
+                }
+                let summary = if game == 0 {
+                    SUMMARY.to_owned()
+                } else {
+                    SUMMARY.replace("Your_Turn:+", "Your_Turn:-")
+                };
+                for line in summary.lines() {
+                    send(write, line).await;
+                }
+                assert_eq!(next_nonempty(lines).await, format!("AGREE {GAME_ID}"));
+                send(write, &format!("START:{GAME_ID}")).await;
+                if game == 0 {
+                    let ours = next_nonempty(lines).await;
+                    assert!(ours.starts_with("+7776FU"), "{ours}");
+                    send(write, "+7776FU,T1").await;
+                }
+                send(write, "%TORYO").await;
+                send(write, "#RESIGN").await;
+                send(write, "#WIN").await;
+                if game == 1 {
+                    assert_eq!(next_nonempty(lines).await, "LOGOUT");
+                } else if eof {
+                    connection = None;
+                }
+            }
+        });
+        let mut config = BridgeConfig::floodgate("us", "secret");
+        config.games = 2;
+        config.x1 = x1;
+        config.game_name = explicit.then(|| "audit".to_owned());
+        let engine_path = std::env::current_exe().unwrap();
+        let core = SessionCore::new(config, "fake", "test");
+        let shell_config = ShellConfig {
+            host: addr.ip().to_string(),
+            port: addr.port(),
+            engine_path,
+            engine_args: vec![
+                "--ignored".into(),
+                "--exact".into(),
+                "fake_usi_engine".into(),
+                "--nocapture".into(),
+            ],
+            engine_dir: None,
+            log_dir: log_dir.clone(),
+            quit_grace: Duration::from_secs(1),
+            redact: vec!["secret".into()],
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            shell::run(core, shell_config).await.unwrap();
+            server.await.unwrap();
+        })
+        .await
+        .expect("two games and LOGOUT must complete");
+        let events = read_log_file(&log_dir, "-events.jsonl").await;
+        let records: Vec<serde_json::Value> =
+            events.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(records.iter().filter(|r| r["type"] == "game_end").count(), 2);
+        assert_eq!(records.last().unwrap()["type"], "bridge_stop");
+        tokio::fs::remove_dir_all(log_dir).await.unwrap();
+    }
 }
 
 async fn send(write: &mut tokio::net::tcp::OwnedWriteHalf, text: &str) {

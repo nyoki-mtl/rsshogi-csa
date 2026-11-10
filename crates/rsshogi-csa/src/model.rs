@@ -180,14 +180,18 @@ impl fmt::Display for CsaMove {
 
 /// A move line, optionally annotated with consumed time and a comment.
 ///
-/// The server annotates every broadcast move with `,T<seconds>`. Clients may
+/// The server annotates broadcast moves with `,T<integer>`. Clients may
 /// annotate their own moves with a `,'` comment, which floodgate uses to carry
 /// evaluation and principal variation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MoveLine {
     /// The move itself.
     pub csa: CsaMove,
-    /// Time consumed for this move, in `Time_Unit` units.
+    /// Raw integer time annotation, without unit conversion.
+    ///
+    /// Normally expressed in `Time_Unit` units. Server implementations may
+    /// differ (for example, stopwatch clocks); the session consumer must define
+    /// the normalization. Fractional annotations are not supported.
     pub elapsed: Option<u64>,
     /// Comment text, without the leading `'`.
     pub comment: Option<String>,
@@ -539,7 +543,7 @@ pub enum CsaCommand {
     Special {
         /// Which special move.
         kind: SpecialMove,
-        /// Time consumed, in `Time_Unit` units.
+        /// Raw integer time annotation, with the same unit contract as [`MoveLine::elapsed`].
         elapsed: Option<u64>,
     },
     /// An empty line, used as an application-level keepalive.

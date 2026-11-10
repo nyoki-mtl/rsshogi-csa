@@ -18,6 +18,7 @@
 pub mod clock;
 pub mod config;
 pub mod game_state;
+pub mod probe;
 pub mod record;
 pub mod session;
 pub mod shell;

@@ -5,6 +5,38 @@
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-10
+
+### Added
+
+- bridgeのusiok、readyok、LOGINに有限の準備期限を設けた。
+  CLIの`--usi-timeout-ms`、`--ready-timeout-ms`、`--login-timeout-ms`で変更できる。
+- 有界の独立writerでengineとCSAの送信を隔離し、stdinを読まない実child、部分送信、世代通知、連続対局の回帰試験を追加した。
+- 局面と探索世代に結び付く任意の`*-probe.jsonl`を、対局ログとは独立した有界writerへ出力する。
+  probeの欠落や保存失敗は対局を中断しない。
+
+### Fixed
+
+- stop送信が遅れても、手番開始に固定したfallback期限を延長しないようにした。
+  `stop_grace_ms < margin_ms`をCLIとcore起動時に検査する。
+- engineのwrite、TCP接続、quit書込みによって中心処理が無期限に停止する問題を修正した。
+- 明示game nameを持つx1で、終局後やREJECT後に次局を一度だけ登録する。
+- 非x1の終局時切断を決め打ちせず、接続維持での次局と明示LOGOUTに対応した。
+- 失効探索を排出するまで次のgoを保留し、別局面のPVや旧engine世代の出力を着手へ混入させない。
+- engine交換待ちの経過時間を、秒読みと加算時間を含む元の着手予算から差し引く。
+- codecのTをrawな整数通信値として説明し、Time_Unitとの正規化境界と未対応範囲を明記した。
+
+### Changed
+
+- bridgeのRust APIでは`BridgeConfig`へ準備期限の3フィールドを追加した。
+  struct literalを使うconsumerは追加指定が必要になるため、0.2.0とした。
+  `BridgeConfig::floodgate`を使う場合は既定値が設定される。
+- codecの公開型と整数Tのparse/formatは維持する。両crateのversionは0.2.0に揃える。
+- wire/engineログの送信行は、投入時点からローカルwrite完了時点の記録に変わる。
+  serverの受理を示すものではない。
+- 既存event schema、contract fixture、`go.deadline_at`の意味は維持する。
+  分単位StopWatchClock、小数T、公式大会での接続資格確認は本リリースに含めない。
+
 ## [0.1.3] - 2026-08-17
 
 ### Added

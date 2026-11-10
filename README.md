@@ -40,6 +40,7 @@ shogiarena dashboard watch --csa-log-dir .\logs --port 7777
 
 - **[ガイド / mdBook](https://nyoki-mtl.github.io/rsshogi-csa/)**：workspace の目的と各 crate の役割
 - **[Rust API リファレンス](https://docs.rs/rsshogi-csa)**：CSA codec の型と関数
+- **[対局期限と接続の契約](docs/bridge-reliability.md)**：停止猶予、準備期限、次局登録、operatorの移行条件
 
 ## ライセンス
 

@@ -234,6 +234,270 @@ fn hang_config() -> BridgeConfig {
     config
 }
 
+#[test]
+fn invalid_deadline_settings_stop_before_spawning_or_connecting() {
+    for (margin, grace) in [(600, 1000), (500, 500), (0, 0)] {
+        let mut settings = config();
+        settings.margin_ms = margin;
+        settings.stop_grace_ms = grace;
+        assert!(settings.validate().is_err());
+        let mut harness = Harness::new(settings);
+        let actions = harness.feed(Event::Started { at: 0 });
+        assert!(!actions.contains(&Action::SpawnEngine));
+        assert!(!actions.contains(&Action::Connect));
+        assert!(actions.iter().any(|a| matches!(a, Action::Shutdown { .. })));
+    }
+    let mut settings = config();
+    settings.stop_grace_ms = 0;
+    assert!(settings.validate().is_ok());
+    settings.ready_timeout_ms = 0;
+    assert!(settings.validate().is_err());
+}
+
+fn short_increment_harness() -> Harness {
+    let mut settings = hang_config();
+    settings.margin_ms = 600;
+    settings.stop_grace_ms = 500;
+    let mut harness = Harness::new(settings);
+    harness.start_game(
+        &PROPOSAL.replace("Total_Time:900", "Total_Time:0").replace("Increment:0", "Increment:2"),
+    );
+    harness.engine(70, "info depth 1 score cp 0 pv 7g7f");
+    harness
+}
+
+#[test]
+fn late_stop_only_waits_until_the_fixed_fallback_deadline() {
+    let mut harness = short_increment_harness();
+    assert_eq!(harness.core.next_deadline(), Some(1459));
+    assert!(engine_lines(&harness.tick(1800)).contains(&"stop".to_owned()));
+    assert_eq!(harness.core.next_deadline(), Some(1959));
+    assert!(server_lines(&harness.tick(1958)).is_empty());
+    assert!(server_lines(&harness.tick(1959))[0].starts_with("+7776FU"));
+    assert!(server_lines(&harness.tick(2459)).is_empty(), "only one fallback");
+}
+
+#[test]
+fn waking_after_both_deadlines_falls_back_in_the_same_step() {
+    let mut harness = short_increment_harness();
+    let actions = harness.tick(2000);
+    assert!(server_lines(&actions)[0].starts_with("+7776FU"));
+    assert!(server_lines(&harness.engine(2001, "bestmove 2g2f")).is_empty());
+}
+
+#[test]
+fn an_answer_after_the_fixed_fallback_deadline_cannot_replace_the_fallback() {
+    let mut harness = short_increment_harness();
+    let actions = harness.engine(1960, "bestmove 2g2f");
+    assert_eq!(server_lines(&actions).len(), 1);
+    assert!(server_lines(&actions)[0].starts_with("+7776FU"));
+}
+
+#[test]
+fn margin_exhausting_the_budget_never_adds_stop_grace() {
+    let mut settings = hang_config();
+    settings.margin_ms = 3000;
+    let mut harness = Harness::new(settings);
+    harness.start_game(
+        &PROPOSAL.replace("Total_Time:900", "Total_Time:0").replace("Increment:0", "Increment:2"),
+    );
+    let last = harness.log.last().unwrap();
+    assert!(!matches!(last, Action::SendEngine(_)));
+    assert!(harness.log.iter().any(|action| matches!(
+        action,
+        Action::SendServer(rsshogi_csa::CsaCommand::Special { .. })
+    )));
+}
+
+#[test]
+fn usi_and_ready_timeouts_have_finite_attempts_and_accept_boundary_responses() {
+    let mut settings = config();
+    settings.usi_timeout_ms = 100;
+    settings.ready_timeout_ms = 200;
+    settings.max_engine_restarts = 1;
+    let mut harness = Harness::new(settings.clone());
+    harness.feed(Event::Started { at: 0 });
+    assert_eq!(harness.core.next_deadline(), Some(100));
+    assert!(harness.tick(100).contains(&Action::SpawnEngine));
+    assert!(harness.tick(200).iter().any(|a| matches!(a, Action::Shutdown { .. })));
+
+    let mut harness = Harness::new(settings.clone());
+    harness.feed(Event::Started { at: 0 });
+    harness.engine(100, "usiok");
+    assert_eq!(harness.core.next_deadline(), Some(300));
+    assert!(harness.engine(300, "readyok").contains(&Action::Connect));
+
+    let mut harness = Harness::new(settings.clone());
+    harness.feed(Event::Started { at: 0 });
+    harness.engine(10, "usiok");
+    assert!(harness.tick(210).contains(&Action::SpawnEngine));
+    assert_eq!(harness.core.next_deadline(), Some(310));
+
+    let mut harness = Harness::new(settings);
+    harness.feed(Event::Started { at: 0 });
+    let late = harness.engine(101, "usiok");
+    assert!(late.contains(&Action::SpawnEngine));
+    assert!(!engine_lines(&late).contains(&"isready".to_owned()));
+}
+
+#[test]
+fn login_and_connection_have_deadlines_but_pairing_does_not() {
+    let mut harness = Harness::new(config());
+    harness.feed(Event::Started { at: 0 });
+    harness.engine(10, "usiok");
+    harness.engine(20, "readyok");
+    assert_eq!(harness.core.next_deadline(), Some(30020));
+    assert!(harness.tick(30020).iter().any(|a| matches!(a, Action::Shutdown { .. })));
+
+    let mut harness = Harness::new(config());
+    harness.feed(Event::Started { at: 0 });
+    harness.engine(10, "usiok");
+    harness.engine(20, "readyok");
+    harness.feed(Event::Connected { at: 30 });
+    assert_eq!(harness.core.next_deadline(), Some(30030));
+    assert!(harness.tick(30030).iter().any(|a| matches!(a, Action::Shutdown { .. })));
+
+    let mut harness = waiting_harness();
+    assert!(!harness.tick(1_000_000).iter().any(|a| matches!(a, Action::Shutdown { .. })));
+}
+
+#[test]
+fn an_exit_after_preparation_timeout_does_not_kill_the_replacement() {
+    let mut settings = config();
+    settings.usi_timeout_ms = 100;
+    settings.max_engine_restarts = 1;
+    let mut harness = Harness::new(settings);
+    harness.feed(Event::Started { at: 0 });
+    let actions = harness.feed(Event::EngineExited { at: 101 });
+    assert_eq!(actions.iter().filter(|a| matches!(a, Action::SpawnEngine)).count(), 1);
+    assert!(!actions.iter().any(|a| matches!(a, Action::Shutdown { .. })));
+    harness.engine(102, "usiok");
+    assert!(harness.engine(103, "readyok").contains(&Action::Connect));
+}
+
+#[test]
+fn stopping_during_a_proposal_closes_after_reject_or_summary_completion() {
+    let mut harness = waiting_harness();
+    harness.summary(50, PROPOSAL);
+    harness.feed(Event::Operator { at: 55, command: OperatorCommand::StopAfterGame });
+    let rejected = harness.server(60, "REJECT:test by them");
+    assert_eq!(server_lines(&rejected), ["LOGOUT"]);
+    assert!(rejected.iter().any(|a| matches!(a, Action::Shutdown { .. })));
+
+    let mut harness = waiting_harness();
+    harness.server(50, "BEGIN Game_Summary");
+    harness.feed(Event::Operator { at: 55, command: OperatorCommand::StopAfterGame });
+    let mark = harness.mark();
+    for line in PROPOSAL.lines().skip(1) {
+        harness.server(60, line);
+    }
+    let lines = server_lines(harness.since(mark));
+    assert!(lines[0].starts_with("REJECT"));
+    assert_eq!(lines[1], "LOGOUT");
+    assert!(!lines.iter().any(|l| l.starts_with("AGREE")));
+}
+
+#[test]
+fn failed_connections_stop_after_three_attempts() {
+    let mut harness = Harness::new(forever_config());
+    harness.feed(Event::Started { at: 0 });
+    harness.engine(10, "usiok");
+    harness.engine(20, "readyok");
+    for at in [100, 200] {
+        assert!(harness.feed(Event::ServerEof { at }).contains(&Action::Connect));
+    }
+    let exhausted = harness.feed(Event::ServerEof { at: 300 });
+    assert!(!exhausted.contains(&Action::Connect));
+    assert!(exhausted.iter().any(|a| matches!(a, Action::Shutdown { .. })));
+}
+
+#[test]
+fn explicit_x1_registers_once_after_old_search_drains_and_not_after_stop() {
+    let mut settings = forever_config();
+    settings.x1 = true;
+    settings.game_name = Some("audit".to_owned());
+    let mut harness = Harness::new(settings.clone());
+    harness.start_game(PROPOSAL);
+    assert_eq!(server_lines(&harness.log).iter().filter(|s| s.starts_with("%%GAME")).count(), 1);
+    assert!(server_lines(&harness.server(100, "#LOSE")).is_empty());
+    assert!(server_lines(&harness.server(101, "#LOSE")).is_empty());
+    let drained = harness.engine(110, "bestmove 7g7f");
+    assert_eq!(server_lines(&drained), ["%%GAME audit *"]);
+    assert!(server_lines(&harness.tick(120)).is_empty());
+
+    let mut harness = Harness::new(settings);
+    harness.start_game(PROPOSAL);
+    harness.feed(Event::Operator { at: 90, command: OperatorCommand::StopAfterGame });
+    assert_eq!(server_lines(&harness.server(100, "#LOSE")), ["LOGOUT"]);
+    assert!(server_lines(&harness.engine(110, "bestmove 7g7f")).is_empty());
+}
+
+#[test]
+fn tournament_progress_sends_no_explicit_registration_and_plain_csa_can_continue() {
+    for x1 in [false, true] {
+        let mut settings = forever_config();
+        settings.x1 = x1;
+        let mut harness = Harness::new(settings);
+        harness.start_game(PROPOSAL);
+        harness.engine(100, "bestmove 7g7f");
+        harness.server(120, "#LOSE");
+        harness.summary(200, WHITE_PROPOSAL);
+        harness.server(210, "START:second");
+        harness.server(220, "+7776FU,T1");
+        assert!(!server_lines(&harness.log).iter().any(|s| s.starts_with("%%GAME")));
+        assert!(
+            harness.records().iter().filter(|b| matches!(b, RecordBody::GameStart { .. })).count()
+                == 2
+        );
+        let closing = harness.feed(Event::Operator { at: 230, command: OperatorCommand::Quit });
+        assert_eq!(server_lines(&closing), ["LOGOUT"]);
+    }
+}
+
+#[test]
+fn rejected_x1_proposal_registers_once_and_stop_cancels_pending_registration() {
+    let mut settings = forever_config();
+    settings.x1 = true;
+    settings.game_name = Some("audit".into());
+    let mut harness = Harness::new(settings.clone());
+    harness.feed(Event::Started { at: 0 });
+    harness.engine(10, "usiok");
+    harness.engine(20, "readyok");
+    harness.feed(Event::Connected { at: 30 });
+    harness.server(40, "LOGIN:us OK");
+    harness.summary(50, PROPOSAL);
+    let rejected = harness.server(60, "REJECT:test by them");
+    assert_eq!(server_lines(&rejected), ["%%GAME audit *"]);
+    assert!(server_lines(&harness.server(61, "REJECT:test by them")).is_empty());
+
+    let mut harness = Harness::new(settings);
+    harness.start_game(PROPOSAL);
+    harness.server(100, "#LOSE");
+    let stopped =
+        harness.feed(Event::Operator { at: 105, command: OperatorCommand::StopAfterGame });
+    assert_eq!(server_lines(&stopped), ["LOGOUT"]);
+    assert!(server_lines(&harness.engine(110, "bestmove 7g7f")).is_empty());
+}
+
+#[test]
+fn ponderhit_keeps_the_same_fixed_fallback_when_stop_is_late() {
+    let mut settings = hang_config();
+    settings.margin_ms = 600;
+    settings.stop_grace_ms = 500;
+    let mut harness = Harness::new(settings);
+    harness.start_game(
+        &PROPOSAL.replace("Total_Time:900", "Total_Time:0").replace("Increment:0", "Increment:2"),
+    );
+    harness.engine(100, "bestmove 7g7f ponder 3c3d");
+    harness.server(200, "+7776FU,T1");
+    harness.server(300, "-3334FU,T1");
+    // Remaining time is 1 second plus the next 2 second increment, budget 2999ms.
+    assert_eq!(harness.core.next_deadline(), Some(2699));
+    harness.tick(2900);
+    assert_eq!(harness.core.next_deadline(), Some(3199));
+    assert!(server_lines(&harness.tick(3199)).len() == 1);
+}
+
 fn server_lines(actions: &[Action]) -> Vec<String> {
     actions
         .iter()
@@ -295,9 +559,7 @@ fn terminal_burst_can_replace_our_move_echo() {
     assert_eq!(terminal, ["#TIME_UP".to_owned(), "#LOSE".to_owned()]);
 
     assert!(engine_lines(&b).iter().any(|line| line == "gameover lose"));
-    // `game.rb` ends the connection along with the game for a plain-CSA player,
-    // so a `LOGOUT` here would only race the teardown.
-    assert!(server_lines(&b).is_empty(), "nothing may be sent after the game is over");
+    assert_eq!(server_lines(&b), ["LOGOUT"]);
     assert!(b.iter().any(|action| matches!(action, Action::Shutdown { .. })));
 }
 
@@ -645,6 +907,7 @@ fn a_resumed_game_replays_into_the_right_clock_and_turn() {
 fn denryu_zero_time_buoy_replays_t602_and_starts_with_the_increment() {
     let mut config = config();
     config.margin_ms = 500;
+    config.stop_grace_ms = 400;
     let mut harness = Harness::new(config);
     harness.feed(Event::Started { at: 0 });
     harness.engine(10, "usiok");
@@ -1138,29 +1401,189 @@ fn a_wrong_prediction_is_released_before_the_real_search_starts() {
 }
 
 #[test]
-fn a_miss_the_engine_never_releases_still_runs_the_ladder_on_time() {
+fn a_miss_the_engine_never_releases_replaces_the_process_before_reusing_it() {
     let mut harness = Harness::new(hang_config());
     harness.start_game(PROPOSAL);
     harness.engine(100, "bestmove 7g7f ponder 3c3d");
     harness.server(200, "+7776FU,T3");
     harness.engine(250, "info depth 20 score cp 60 pv 2g2f 8c8d");
     harness.server(300, "-8384FU,T4");
-
-    // The engine ignored the stop. Our own clock is what bounds the wait — not a
-    // grace window, which would resign over a slow release, and not forever.
+    // 実局面でも合法なPVを失効後に送っても、fallbackには採用しない。
+    harness.engine(310, "info depth 22 score cp 999 pv 2g2f");
     let deadline = harness.core.next_deadline().expect("our own clock bounds this");
-    assert!(deadline > 300);
-    let stopping = harness.tick(deadline);
-    assert!(engine_lines(&stopping).iter().any(|line| line == "stop"));
+    assert_eq!(deadline, 300 + hang_config().stop_grace_ms);
+    let replacement = harness.tick(deadline);
+    assert!(replacement.contains(&Action::SpawnEngine));
+    assert!(harness.alerts().contains(&AlertCode::EngineRestarted));
+    assert!(server_lines(&replacement).is_empty());
+    harness.engine(deadline + 1, "usiok");
+    let resumed = harness.engine(deadline + 2, "readyok");
+    assert!(go_line(&resumed).is_some());
+}
 
-    let hard = harness.core.next_deadline().expect("the grace deadline is armed");
-    let laddered = harness.tick(hard);
-    assert!(harness.alerts().contains(&AlertCode::EngineHang));
-    assert_eq!(
-        server_lines(&laddered),
-        ["%TORYO"],
-        "the pv belonged to the other position, so there is nothing to fall back to"
-    );
+#[test]
+fn next_game_waits_for_the_previous_bestmove_before_sending_usi_setup() {
+    let mut harness = Harness::new(forever_config());
+    harness.start_game(PROPOSAL);
+    harness.server(100, "#LOSE");
+    let mark = harness.mark();
+    harness.summary(110, PROPOSAL);
+    harness.server(120, "START:test+floodgate-900-0+us+them+20260804120000");
+    assert!(engine_lines(harness.since(mark)).is_empty());
+    let drained = harness.engine(130, "bestmove 7g7f");
+    assert!(server_lines(&drained).is_empty());
+    assert!(engine_lines(&drained).iter().any(|line| line == "usinewgame"));
+    assert!(go_line(&drained).is_some());
+    let actual = harness.engine(140, "bestmove 2g2f");
+    assert_eq!(server_lines(&actual), ["+2726FU"]);
+}
+
+#[test]
+fn engine_exit_between_games_clears_the_old_drain_before_replacement() {
+    let mut settings = forever_config();
+    settings.max_engine_restarts = 1;
+    let mut harness = Harness::new(settings);
+    harness.start_game(PROPOSAL);
+    harness.server(100, "#LOSE");
+    let restarted = harness.feed(Event::EngineExited { at: 110 });
+    assert!(restarted.contains(&Action::SpawnEngine));
+    harness.engine(120, "usiok");
+    harness.engine(130, "readyok");
+    assert!(!harness.tick(2000).contains(&Action::SpawnEngine));
+    harness.summary(2010, PROPOSAL);
+    let start = harness.server(2020, "START:test+floodgate-900-0+us+them+20260804120000");
+    assert!(go_line(&start).is_some());
+}
+
+fn info_context(actions: &[Action]) -> rsshogi_csa_bridge::probe::SearchContext {
+    actions
+        .iter()
+        .find_map(|action| match action {
+            Action::Probe(record) if record.body["type"] == "info" => record.context.clone(),
+            _ => None,
+        })
+        .expect("info carries its own immutable search identity")
+}
+
+#[test]
+fn probe_ponder_hit_keeps_identity_and_root_while_miss_info_remains_discarded() {
+    for hit in [true, false] {
+        let mut harness = Harness::new(hang_config());
+        harness.start_game(PROPOSAL);
+        let normal = info_context(&harness.engine(90, "info depth 1 pv 7g7f"));
+        assert_eq!(normal.base_ply, 0);
+        assert_eq!(normal.origin, "normal");
+        let game_start_seq = harness
+            .log
+            .iter()
+            .find_map(|action| match action {
+                Action::Log(record) if matches!(record.body, RecordBody::GameStart { .. }) => {
+                    Some(record.seq)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(normal.game_start_seq, game_start_seq.to_string());
+        harness.engine(100, "bestmove 7g7f ponder 3c3d");
+        harness.server(200, "+7776FU,T1");
+        let ponder = info_context(&harness.engine(210, "info depth 2 pv 2g2f"));
+        assert_eq!(ponder.origin, "ponder");
+        assert_eq!(ponder.base_ply, 1);
+        assert_ne!(ponder.search_id, normal.search_id);
+        assert_eq!(ponder.predicted_usi.as_deref(), Some("3c3d"));
+        harness.server(300, if hit { "-3334FU,T1" } else { "-8384FU,T1" });
+        let late = info_context(&harness.engine(310, "info depth 3 pv 2g2f"));
+        assert_eq!(late.search_id, ponder.search_id);
+        assert_eq!(late.root_sfen, ponder.root_sfen);
+        assert_eq!(late.state, if hit { "thinking" } else { "discarded" });
+        assert_eq!(late.ponder_outcome.as_deref(), Some(if hit { "hit" } else { "miss" }));
+        if !hit {
+            harness.engine(320, "bestmove 2g2f");
+            let current = info_context(&harness.engine(330, "info depth 4 pv 2g2f"));
+            assert_ne!(current.search_id, late.search_id);
+            assert_ne!(current.root_sfen, late.root_sfen);
+            assert_eq!(current.base_ply, 2);
+        }
+    }
+}
+
+#[test]
+fn malformed_huge_bestmove_does_not_get_copied_into_probe_records() {
+    let mut harness = Harness::new(config());
+    harness.start_game(PROPOSAL);
+    let actions = harness.engine(100, &format!("bestmove {}", "x".repeat(100_000)));
+    let probes: Vec<_> = actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Probe(record) => Some(record),
+            _ => None,
+        })
+        .collect();
+    assert!(probes.iter().any(|record| record.body["reason"] == "oversized_bestmove"));
+    assert!(probes.iter().all(|record| serde_json::to_vec(record).unwrap().len() < 64 * 1024));
+}
+
+fn restarting_missed_ponder() -> Harness {
+    let mut settings = hang_config();
+    settings.margin_ms = 1001;
+    let mut harness = Harness::new(settings);
+    harness.start_game(&PROPOSAL.replace("Total_Time:900", "Total_Time:10"));
+    harness.engine(100, "bestmove 7g7f ponder 3c3d");
+    harness.server(200, "+7776FU,T1");
+    harness.server(300, "-8384FU,T1");
+    let replace = harness.tick(1300);
+    assert!(replace.contains(&Action::SpawnEngine));
+    harness
+}
+
+#[test]
+fn replacement_warmup_preserves_the_original_turn_deadline_and_charges_elapsed_time() {
+    let mut harness = restarting_missed_ponder();
+    assert_eq!(harness.core.next_deadline(), Some(8298));
+    harness.engine(2000, "usiok");
+    let ready = harness.engine(4000, "readyok");
+    let go = go_line(&ready).unwrap();
+    assert!(go.contains("btime 4299"), "{go}");
+    assert_eq!(harness.core.next_deadline(), Some(8298));
+}
+
+#[test]
+fn replacement_warmup_charges_byoyomi_after_main_time_is_exhausted() {
+    for (main_seconds, expected_byoyomi) in [(1, 5700), (2, 6700)] {
+        let mut settings = hang_config();
+        settings.margin_ms = 600;
+        settings.stop_grace_ms = 500;
+        let summary = PROPOSAL
+            .replace("Total_Time:900", &format!("Total_Time:{main_seconds}"))
+            .replace("Byoyomi:0", "Byoyomi:10");
+        let mut harness = Harness::new(settings);
+        harness.start_game(&summary);
+        harness.engine(100, "bestmove 7g7f ponder 3c3d");
+        harness.server(200, "+7776FU,T1");
+        harness.server(300, "-8384FU,T1");
+        assert!(harness.tick(1300).contains(&Action::SpawnEngine));
+        let original_deadline = harness.core.next_deadline();
+        harness.engine(2000, "usiok");
+        let resumed = harness.engine(4000, "readyok");
+        let go = go_line(&resumed).unwrap();
+        assert!(go.contains("btime 0"), "{go}");
+        assert!(go.contains(&format!("byoyomi {expected_byoyomi}")), "{go}");
+        assert_eq!(harness.core.next_deadline(), original_deadline);
+    }
+}
+
+#[test]
+fn missing_or_late_readyok_cannot_extend_the_turn_budget() {
+    let mut harness = restarting_missed_ponder();
+    harness.engine(2000, "usiok");
+    assert_eq!(server_lines(&harness.tick(9300)), ["%TORYO"]);
+    let late = harness.engine(10000, "readyok");
+    assert!(go_line(&late).is_none());
+    let mut harness = restarting_missed_ponder();
+    harness.engine(2000, "usiok");
+    let late = harness.engine(10000, "readyok");
+    assert!(go_line(&late).is_none());
+    assert_eq!(server_lines(&late), ["%TORYO"]);
 }
 
 #[test]
@@ -1394,15 +1817,13 @@ fn leaving_the_pairing_queue_logs_out_rather_than_dropping_the_socket() {
 }
 
 #[test]
-fn a_finished_plain_csa_game_leaves_the_close_to_the_server() {
+fn a_finished_plain_csa_game_explicitly_logs_out() {
     let mut harness = Harness::new(config());
     harness.start_game(PROPOSAL);
     harness.server(100, "#TIME_UP");
     let closing = harness.server(100, "#LOSE");
 
-    // `game.rb:234` calls `player.finish` for a plain-CSA player when the game
-    // ends, so the socket is already being torn down.
-    assert!(server_lines(&closing).is_empty());
+    assert_eq!(server_lines(&closing), ["LOGOUT"]);
     assert!(closing.iter().any(|action| matches!(action, Action::Shutdown { .. })));
 }
 

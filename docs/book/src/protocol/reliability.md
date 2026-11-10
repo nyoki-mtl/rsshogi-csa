@@ -10,6 +10,11 @@ CSA server は、client の行末 LF を受け取った時点までを消費時�
 
 bridge は、この確定値を `ClockLedger` に適用します。
 
+codecはTを通信上の整数値として保持し、bridgeがTime_Unit単位として解釈します。
+主な運用対象は`Time_Unit:1sec`と整数Tです。
+`Time_Unit:1min`でsummary値やTを秒として送るStopWatchClockは未対応です。
+小数Tも未対応であり、それを送るserverでの対局には使用できません。
+
 `Total_Time`、`Byoyomi`、`Increment`、`Delay`、`Least_Time_Per_Move`、`Time_Roundup` を決め打ちせず、proposal に従って台帳を更新します。
 
 local clock は、今 engine に許す探索時間を決めるためだけに使います。
@@ -56,6 +61,11 @@ keepalive は JSONL の heartbeat とは別物です。
 前者は server との TCP 接続を保つための空行であり、後者は外部 reader が bridge の沈黙を読めるようにする記録です。
 
 対局中の TCP 切断は、再接続で対局を続ける経路ではありません。
+
+正常終局後にEOFを受けた場合は、残り局数があれば同一プロセスで再接続します。
+終局後も接続を保つ通常CSA serverでは、その接続で次のsummaryを受け取ります。
+非x1であることだけから終局時の切断を決めつけません。
+明示終了では、接続が残っていればLOGOUTを送信します。
 
 socket、engine I/O、log writer を分け、socket task を log I/O で止めない構成は、この制約から来ています。
 

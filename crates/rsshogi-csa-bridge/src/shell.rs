@@ -4,9 +4,8 @@
 //! clock. It performs the [`Action`]s the core returns and turns the outside
 //! world back into [`Event`]s. It holds no protocol knowledge of its own.
 //!
-//! The socket's write half stays in the main loop and nothing else can block it:
-//! log writing happens on its own task behind a channel, and both readers push
-//! into an unbounded queue rather than being polled.
+//! Each socket and engine generation has one writer with a bounded queue.
+//! The main loop never awaits their writes or a connection attempt.
 //!
 //! # Nothing here may end the process
 //!
@@ -23,16 +22,20 @@
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rsshogi_csa::format_command;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::probe::ProbeWriter;
 use crate::record::{LogRecord, Millis};
 use crate::session::{Action, Event, OperatorCommand, SessionCore};
 
@@ -87,7 +90,28 @@ impl WireDir {
 /// would otherwise look like the replacement dying and burn a second restart.
 enum Incoming {
     Event(Event),
+    EngineLine { at: Millis, generation: u64, line: String },
     EngineGone { at: Millis, generation: u64 },
+    Connection { generation: u64, result: io::Result<TcpStream> },
+    Server { generation: u64, event: Event },
+}
+
+impl Incoming {
+    fn for_generation(self, current: u64) -> Option<Event> {
+        match self {
+            Self::Event(event) => Some(event),
+            Self::EngineLine { at, generation, line } if generation == current => {
+                Some(Event::EngineLine { at, line })
+            }
+            Self::EngineGone { at, generation } if generation == current => {
+                Some(Event::EngineExited { at })
+            }
+            Self::EngineLine { .. }
+            | Self::EngineGone { .. }
+            | Self::Connection { .. }
+            | Self::Server { .. } => None,
+        }
+    }
 }
 
 enum LogLine {
@@ -107,6 +131,7 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
     // Nothing is lost by refusing to start; a game played with no record is a
     // game the operator cannot see, audit, or trust.
     let (run_id, files) = create_log_files(&config.log_dir).await?;
+    let probe = ProbeWriter::start(&config.log_dir, run_id, config.redact.clone()).await;
     // The id the dashboard keys on. Printed because it is no longer guessable
     // from the clock now that it carries milliseconds and may have been bumped.
     eprintln!("run {run_id}: logging to {}", config.log_dir.display());
@@ -123,16 +148,23 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
         start,
         event_tx,
         events_log_lost: false,
+        server_submission_lost: false,
         log_tx,
         server_write: None,
         server_reader: None,
-        engine_stdin: None,
+        engine_writer: None,
+        engine_readers: Vec::new(),
+        retired_engines: Vec::new(),
+        engine_cleanup_failed: Arc::new(AtomicBool::new(false)),
+        server_generation: 0,
+        connector: None,
         child: None,
         engine_generation: 0,
+        probe,
     };
 
     let actions = core.step(Event::Started { at: shell.now() });
-    let mut done = shell.execute(actions).await;
+    let mut done = shell.execute(actions);
 
     while !done {
         // Wake for whichever comes first: a protocol deadline, or the moment a
@@ -144,12 +176,16 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
             break;
         };
         let actions = core.step(event);
-        done = shell.execute(actions).await;
+        done = shell.execute(actions);
     }
 
-    shell.stop_engine().await;
+    let engine_cleanup_result = shell.stop_engine().await;
     shell.stop_server_reader().await;
     let events_log_lost = shell.events_log_lost;
+    let server_submission_lost = shell.server_submission_lost;
+    if let Some(probe) = shell.probe.take() {
+        probe.finish().await;
+    }
     drop(shell);
 
     // The writer's result was discarded here. A disk-full or flush failure ended
@@ -163,6 +199,12 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
     if let Err(err) = writer_result {
         eprintln!("FATAL: the event log writer failed: {err}");
         return Err(err);
+    }
+    engine_cleanup_result?;
+    if server_submission_lost {
+        return Err(io::Error::other(
+            "a critical CSA command could not be queued; this run lost an outbound submission",
+        ));
     }
     if events_log_lost {
         return Err(io::Error::other(
@@ -183,15 +225,22 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
 /// true: the bridge is in terminal wind-down.
 struct Shell {
     events_log_lost: bool,
+    server_submission_lost: bool,
     config: ShellConfig,
     start: Instant,
     event_tx: mpsc::UnboundedSender<Incoming>,
     log_tx: mpsc::UnboundedSender<LogLine>,
-    server_write: Option<OwnedWriteHalf>,
+    server_write: Option<LineWriter>,
+    server_generation: u64,
+    connector: Option<JoinHandle<()>>,
     server_reader: Option<JoinHandle<()>>,
-    engine_stdin: Option<ChildStdin>,
+    engine_writer: Option<LineWriter>,
+    engine_readers: Vec<JoinHandle<()>>,
+    retired_engines: Vec<JoinHandle<io::Result<()>>>,
+    engine_cleanup_failed: Arc<AtomicBool>,
     child: Option<Child>,
     engine_generation: u64,
+    probe: Option<ProbeWriter>,
 }
 
 impl Shell {
@@ -222,7 +271,7 @@ impl Shell {
     }
 
     async fn next_event(
-        &self,
+        &mut self,
         rx: &mut mpsc::UnboundedReceiver<Incoming>,
         deadline: Option<Millis>,
     ) -> Option<Event> {
@@ -230,24 +279,41 @@ impl Shell {
             let incoming = match deadline {
                 None => rx.recv().await?,
                 Some(deadline) => {
+                    if deadline <= self.now() {
+                        return Some(Event::Tick { at: self.now() });
+                    }
                     let remaining = Duration::from_millis(deadline.saturating_sub(self.now()));
                     tokio::select! {
                         biased;
-                        incoming = rx.recv() => incoming?,
                         () = tokio::time::sleep(remaining) => {
                             return Some(Event::Tick { at: self.now() });
                         }
+                        incoming = rx.recv() => incoming?,
                     }
                 }
             };
-            match incoming {
-                Incoming::Event(event) => return Some(event),
-                Incoming::EngineGone { at, generation } => {
-                    if generation == self.engine_generation {
-                        return Some(Event::EngineExited { at });
+            let incoming = match incoming {
+                Incoming::Connection { generation, result }
+                    if generation == self.server_generation =>
+                {
+                    match result {
+                        Ok(stream) => {
+                            self.install_connection(stream);
+                            return Some(Event::Connected { at: self.now() });
+                        }
+                        Err(err) => {
+                            eprintln!("connect failed: {err}");
+                            return Some(Event::ServerEof { at: self.now() });
+                        }
                     }
-                    // A late report about an engine that has already been replaced.
                 }
+                Incoming::Server { generation, event } if generation == self.server_generation => {
+                    return Some(event)
+                }
+                incoming => incoming,
+            };
+            if let Some(event) = incoming.for_generation(self.engine_generation) {
+                return Some(event);
             }
         }
     }
@@ -255,50 +321,46 @@ impl Shell {
     /// Performs actions, reporting failures as events instead of propagating them.
     ///
     /// Returns whether the core asked to shut down.
-    async fn execute(&mut self, actions: Vec<Action>) -> bool {
+    fn execute(&mut self, actions: Vec<Action>) -> bool {
         for action in actions {
             match action {
                 Action::SpawnEngine => {
-                    // Whatever happened to the previous one is worth recording
-                    // before its handle is replaced.
-                    self.record_engine_status().await;
+                    self.retire_engine();
                     if let Err(err) = self.spawn_engine() {
                         self.report_engine_gone(&format!("engine could not be started: {err}"));
                     }
                 }
                 Action::SendEngine(command) => {
                     let line = rsshogi_usi::format_command(&command);
-                    if let Err(err) = self.write_engine(&line).await {
+                    if let Err(err) = self.write_engine(&line) {
                         // A broken pipe here means the engine is gone. Killing
                         // the bridge over it would drop the socket and lose the
                         // game outright, which is strictly worse.
                         self.report_engine_gone(&format!("engine write failed: {err}"));
                     }
                 }
-                Action::Connect => {
-                    if let Err(err) = self.connect().await {
-                        eprintln!("connect failed: {err}");
-                        // Back off before telling the core, so a server that is
-                        // down cannot spin this loop.
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        let _ = self
-                            .event_tx
-                            .send(Incoming::Event(Event::ServerEof { at: self.now() }));
-                    }
-                }
+                Action::Connect => self.connect(),
                 Action::SendServer(command) => {
                     let line = format_command(&command);
-                    if let Err(err) = self.write_server(&line).await {
-                        eprintln!("server write failed: {err}");
-                        self.server_write = None;
-                        let _ = self
-                            .event_tx
-                            .send(Incoming::Event(Event::ServerEof { at: self.now() }));
+                    if let Err(err) = self.write_server(&line) {
+                        // Congestion is not proof of a dead socket. Keep the
+                        // in-flight frame intact and decline another game.
+                        self.server_submission_lost = true;
+                        eprintln!("server queue unavailable: {err}; critical command was not submitted; stopping after game");
+                        let _ = self.event_tx.send(Incoming::Event(Event::Operator {
+                            at: self.now(),
+                            command: OperatorCommand::StopAfterGame,
+                        }));
                     }
                 }
                 Action::Log(record) => {
                     if self.log_tx.send(LogLine::Record(Box::new(record))).is_err() {
                         self.on_events_log_lost();
+                    }
+                }
+                Action::Probe(record) => {
+                    if let Some(probe) = &mut self.probe {
+                        probe.submit(self.engine_generation, record);
                     }
                 }
                 Action::Shutdown { reason } => {
@@ -317,7 +379,9 @@ impl Shell {
     /// The core treats a repeated report as a no-op.
     fn report_engine_gone(&mut self, detail: &str) {
         eprintln!("{detail}");
-        self.engine_stdin = None;
+        if let Some(writer) = self.engine_writer.take() {
+            writer.task.abort();
+        }
         let _ = self
             .event_tx
             .send(Incoming::EngineGone { at: self.now(), generation: self.engine_generation });
@@ -339,12 +403,19 @@ impl Shell {
         let mut child = command.spawn()?;
         let stdout = child.stdout.take().ok_or_else(|| io::Error::other("engine has no stdout"))?;
         let stderr = child.stderr.take();
-        self.engine_stdin = child.stdin.take();
+        let stdin = child.stdin.take().ok_or_else(|| io::Error::other("engine has no stdin"))?;
+        self.engine_writer = Some(spawn_line_writer(
+            stdin,
+            self.event_tx.clone(),
+            self.log_tx.clone(),
+            self.start,
+            WriterTarget::Engine(generation),
+        ));
 
         let tx = self.event_tx.clone();
         let log_tx = self.log_tx.clone();
         let start = self.start;
-        tokio::spawn(async move {
+        self.engine_readers.push(tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             let reason = loop {
                 match lines.next_line().await {
@@ -355,7 +426,7 @@ impl Shell {
                             dir: WireDir::In,
                             raw: line.clone(),
                         });
-                        if tx.send(Incoming::Event(Event::EngineLine { at, line })).is_err() {
+                        if tx.send(Incoming::EngineLine { at, generation, line }).is_err() {
                             return;
                         }
                     }
@@ -374,11 +445,11 @@ impl Shell {
                 raw: format!("[bridge] engine reader ended: {reason}"),
             });
             let _ = tx.send(Incoming::EngineGone { at, generation });
-        });
+        }));
 
         if let Some(stderr) = stderr {
             let log_tx = self.log_tx.clone();
-            tokio::spawn(async move {
+            self.engine_readers.push(tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     let at = elapsed_ms(start);
@@ -388,21 +459,52 @@ impl Shell {
                         raw: format!("stderr: {line}"),
                     });
                 }
-            });
+            }));
         }
 
         self.child = Some(child);
         Ok(())
     }
 
-    async fn connect(&mut self) -> io::Result<()> {
-        let stream = TcpStream::connect((self.config.host.as_str(), self.config.port)).await?;
-        // Small lines with a hard latency budget: never wait for a full segment.
-        stream.set_nodelay(true)?;
-        let (read, write) = stream.into_split();
-        self.stop_server_reader().await;
-        self.server_write = Some(write);
+    fn connect(&mut self) {
+        self.cancel_server();
+        self.server_generation = self.server_generation.saturating_add(1);
+        let generation = self.server_generation;
+        let host = self.config.host.clone();
+        let port = self.config.port;
+        let tx = self.event_tx.clone();
+        self.connector = Some(tokio::spawn(async move {
+            let result = tokio::time::timeout(
+                Duration::from_secs(30),
+                TcpStream::connect((host.as_str(), port)),
+            )
+            .await
+            .map_or_else(
+                |_| Err(io::Error::new(io::ErrorKind::TimedOut, "CSA connect timed out")),
+                |result| {
+                    result.and_then(|stream| {
+                        stream.set_nodelay(true)?;
+                        Ok(stream)
+                    })
+                },
+            );
+            if result.is_err() {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            let _ = tx.send(Incoming::Connection { generation, result });
+        }));
+    }
 
+    fn install_connection(&mut self, stream: TcpStream) {
+        let generation = self.server_generation;
+        let (read, write) = stream.into_split();
+        self.server_write = Some(spawn_line_writer(
+            write,
+            self.event_tx.clone(),
+            self.log_tx.clone(),
+            self.start,
+            WriterTarget::Server(generation),
+        ));
         let tx = self.event_tx.clone();
         let log_tx = self.log_tx.clone();
         let start = self.start;
@@ -410,84 +512,260 @@ impl Shell {
             let mut lines = BufReader::new(read).lines();
             loop {
                 let Ok(Some(line)) = lines.next_line().await else {
-                    let _ = tx.send(Incoming::Event(Event::ServerEof { at: elapsed_ms(start) }));
+                    let _ = tx.send(Incoming::Server {
+                        generation,
+                        event: Event::ServerEof { at: elapsed_ms(start) },
+                    });
                     return;
                 };
                 let at = elapsed_ms(start);
                 let _ = log_tx.send(LogLine::Wire { at, dir: WireDir::In, raw: line.clone() });
-                if tx.send(Incoming::Event(Event::ServerLine { at, line })).is_err() {
+                if tx
+                    .send(Incoming::Server { generation, event: Event::ServerLine { at, line } })
+                    .is_err()
+                {
                     return;
                 }
             }
         }));
+    }
 
-        let _ = self.event_tx.send(Incoming::Event(Event::Connected { at: self.now() }));
-        Ok(())
+    fn cancel_server(&mut self) {
+        if let Some(task) = self.connector.take() {
+            task.abort();
+        }
+        if let Some(writer) = self.server_write.take() {
+            writer.task.abort();
+        }
+        if let Some(reader) = self.server_reader.take() {
+            reader.abort();
+        }
     }
 
     async fn stop_server_reader(&mut self) {
-        self.server_write = None;
+        if let Some(writer) = self.server_write.take() {
+            drop(writer.tx);
+            let mut task = writer.task;
+            if tokio::time::timeout(self.config.quit_grace, &mut task).await.is_err() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
+        if let Some(task) = self.connector.take() {
+            task.abort();
+            let _ = task.await;
+        }
         if let Some(reader) = self.server_reader.take() {
-            // Await cancellation so the task has dropped its log sender before
-            // `run` closes the channel and joins the writer.
             reader.abort();
             let _ = reader.await;
         }
     }
 
-    async fn write_server(&mut self, line: &str) -> io::Result<()> {
-        let at = self.now();
-        let _ = self.log_tx.send(LogLine::Wire { at, dir: WireDir::Out, raw: line.to_owned() });
-        let Some(write) = &mut self.server_write else {
+    fn write_server(&self, line: &str) -> io::Result<()> {
+        // Reserve space for a critical frame rather than filling a blocked
+        // stream with periodic blank lines.
+        if line.is_empty()
+            && self.server_write.as_ref().is_some_and(|writer| writer.tx.capacity() <= 1)
+        {
             return Ok(());
-        };
-        write.write_all(line.as_bytes()).await?;
-        write.write_all(b"\n").await?;
-        write.flush().await
-    }
-
-    async fn write_engine(&mut self, line: &str) -> io::Result<()> {
-        let at = self.now();
-        let _ = self.log_tx.send(LogLine::Engine { at, dir: WireDir::Out, raw: line.to_owned() });
-        let Some(stdin) = &mut self.engine_stdin else {
-            return Ok(());
-        };
-        stdin.write_all(line.as_bytes()).await?;
-        stdin.write_all(b"\n").await?;
-        stdin.flush().await
-    }
-
-    /// Reports how the engine process finished, for the engine log.
-    ///
-    /// The exit code is what separates "it chose to exit" from "something killed
-    /// it", which the reader task alone cannot tell. It is worth a short wait:
-    /// asking the moment stdout reaches end of file races the process actually
-    /// being reaped, and the answer then reads as "still running" whatever
-    /// happened. That misreading cost an investigation once already.
-    async fn record_engine_status(&mut self) {
-        let Some(child) = &mut self.child else {
-            return;
-        };
-        let raw = match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
-            Ok(Ok(status)) => format!("[bridge] engine exit status: {status}"),
-            Ok(Err(err)) => format!("[bridge] engine status unavailable: {err}"),
-            Err(_) => "[bridge] engine outlived its stdout by 500ms, still running".to_owned(),
-        };
-        let at = self.now();
-        let _ = self.log_tx.send(LogLine::Engine { at, dir: WireDir::In, raw });
-    }
-
-    async fn stop_engine(&mut self) {
-        let _ = self.write_engine("quit").await;
-        self.engine_stdin = None;
-        let Some(child) = &mut self.child else {
-            return;
-        };
-        if tokio::time::timeout(self.config.quit_grace, child.wait()).await.is_err() {
-            eprintln!("engine did not exit within the grace period, killing it");
-            let _ = child.kill().await;
+        }
+        match enqueue(self.server_write.as_ref(), line) {
+            Err(_) if line.is_empty() => Ok(()), // Keepalive is expendable under backpressure.
+            result => result,
         }
     }
+
+    fn write_engine(&self, line: &str) -> io::Result<()> {
+        enqueue(self.engine_writer.as_ref(), line)
+    }
+
+    fn retire_engine(&mut self) {
+        let child = self.child.take();
+        let writer = self.engine_writer.take();
+        let readers = std::mem::take(&mut self.engine_readers);
+        let grace = self.config.quit_grace;
+        let log = self.log_tx.clone();
+        let start = self.start;
+        let failed = self.engine_cleanup_failed.clone();
+        self.retired_engines.retain(|task| !task.is_finished());
+        self.retired_engines.push(tokio::spawn(async move {
+            let result = finish_engine(child, writer, readers, grace, log, start).await;
+            if result.is_err() {
+                failed.store(true, Ordering::Relaxed);
+            }
+            result
+        }));
+    }
+
+    async fn stop_engine(&mut self) -> io::Result<()> {
+        let mut result = finish_engine(
+            self.child.take(),
+            self.engine_writer.take(),
+            std::mem::take(&mut self.engine_readers),
+            self.config.quit_grace,
+            self.log_tx.clone(),
+            self.start,
+        )
+        .await;
+        for task in self.retired_engines.drain(..) {
+            let retired_result = task.await.unwrap_or_else(|err| {
+                Err(io::Error::other(format!("engine cleanup task failed: {err}")))
+            });
+            if result.is_ok() {
+                result = retired_result;
+            }
+        }
+        if result.is_ok() && self.engine_cleanup_failed.load(Ordering::Relaxed) {
+            result =
+                Err(io::Error::other("a retired engine could not be cleaned up; see engine log"));
+        }
+        result
+    }
+}
+
+const WRITE_QUEUE_CAPACITY: usize = 128;
+
+struct LineWriter {
+    tx: mpsc::Sender<String>,
+    task: JoinHandle<()>,
+}
+
+#[derive(Clone, Copy)]
+enum WriterTarget {
+    Engine(u64),
+    Server(u64),
+}
+
+fn enqueue(writer: Option<&LineWriter>, line: &str) -> io::Result<()> {
+    let writer =
+        writer.ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "writer unavailable"))?;
+    writer.tx.try_send(line.to_owned()).map_err(|err| match err {
+        mpsc::error::TrySendError::Full(_) => {
+            io::Error::new(io::ErrorKind::WouldBlock, "outbound queue full")
+        }
+        mpsc::error::TrySendError::Closed(_) => {
+            io::Error::new(io::ErrorKind::BrokenPipe, "outbound queue closed")
+        }
+    })
+}
+
+fn spawn_line_writer<W: AsyncWrite + Unpin + Send + 'static>(
+    mut write: W,
+    tx: mpsc::UnboundedSender<Incoming>,
+    log: mpsc::UnboundedSender<LogLine>,
+    start: Instant,
+    target: WriterTarget,
+) -> LineWriter {
+    let (sender, mut rx) = mpsc::channel::<String>(WRITE_QUEUE_CAPACITY);
+    let task = tokio::spawn(async move {
+        while let Some(raw) = rx.recv().await {
+            // This future retains its byte offset across partial writes. On
+            // cancellation the stream is closed, never replayed or interleaved.
+            let mut framed = raw.as_bytes().to_vec();
+            framed.push(b'\n');
+            if let Err(err) = async {
+                write.write_all(&framed).await?;
+                write.flush().await
+            }
+            .await
+            {
+                eprintln!("outbound write failed: {err}");
+                let at = elapsed_ms(start);
+                let incoming = match target {
+                    WriterTarget::Engine(generation) => Incoming::EngineGone { at, generation },
+                    WriterTarget::Server(generation) => {
+                        Incoming::Server { generation, event: Event::ServerEof { at } }
+                    }
+                };
+                let _ = tx.send(incoming);
+                return;
+            }
+            // Completed local write only; this is not server acknowledgement.
+            let at = elapsed_ms(start);
+            let line = match target {
+                WriterTarget::Engine(_) => LogLine::Engine { at, dir: WireDir::Out, raw },
+                WriterTarget::Server(_) => LogLine::Wire { at, dir: WireDir::Out, raw },
+            };
+            let _ = log.send(line);
+        }
+    });
+    LineWriter { tx: sender, task }
+}
+
+async fn finish_engine(
+    mut child: Option<Child>,
+    writer: Option<LineWriter>,
+    readers: Vec<JoinHandle<()>>,
+    grace: Duration,
+    log: mpsc::UnboundedSender<LogLine>,
+    start: Instant,
+) -> io::Result<()> {
+    let mut cleanup_result = Ok(());
+    let mut writer_task = None;
+    let deadline = tokio::time::Instant::now() + grace;
+    if let Some(writer) = writer {
+        let _ = writer.tx.try_send("quit".to_owned());
+        drop(writer.tx);
+        writer_task = Some(writer.task);
+    }
+    if let Some(child) = &mut child {
+        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
+            Ok(Ok(status)) => format!("[bridge] engine exit status: {status}"),
+            Ok(Err(err)) => {
+                let detail = format!("[bridge] engine status unavailable: {err}");
+                cleanup_result = Err(io::Error::other(detail.clone()));
+                detail
+            }
+            Err(_) => {
+                // Voluntary quit write + wait share `grace`. OS forced
+                // termination/reaping has a separate finite cleanup allowance.
+                match child.start_kill() {
+                    Err(err) => {
+                        let detail =
+                            format!("[bridge] engine exceeded quit grace; kill failed: {err}");
+                        cleanup_result = Err(io::Error::other(detail.clone()));
+                        detail
+                    }
+                    Ok(()) => {
+                        match tokio::time::timeout(Duration::from_secs(1), child.wait()).await {
+                            Ok(Ok(status)) => format!(
+                            "[bridge] engine exceeded quit grace; killed; exit status: {status}"
+                        ),
+                            Ok(Err(err)) => {
+                                let detail =
+                                    format!("[bridge] engine kill requested; reap failed: {err}");
+                                cleanup_result = Err(io::Error::other(detail.clone()));
+                                detail
+                            }
+                            Err(_) => {
+                                let detail =
+                                    "[bridge] engine kill requested; reap timed out after 1s"
+                                        .to_owned();
+                                cleanup_result = Err(io::Error::other(detail.clone()));
+                                detail
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let _ = log.send(LogLine::Engine { at: elapsed_ms(start), dir: WireDir::In, raw: status });
+    }
+    if let Some(mut task) = writer_task {
+        if tokio::time::timeout_at(deadline, &mut task).await.is_err() {
+            task.abort();
+            let _ = task.await;
+        }
+    }
+    for reader in readers {
+        reader.abort();
+        let _ = reader.await;
+    }
+    if let Err(err) = &cleanup_result {
+        eprintln!("engine cleanup failed: {err}");
+    }
+    // Child retains kill_on_drop as a final attempt on cleanup failure.
+    cleanup_result
 }
 
 /// The earlier of two optional wakeups, or whichever one exists.
@@ -639,6 +917,239 @@ async fn writer_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_shell() -> (Shell, mpsc::UnboundedReceiver<Incoming>, mpsc::UnboundedReceiver<LogLine>)
+    {
+        let (event_tx, events) = mpsc::unbounded_channel();
+        let (log_tx, logs) = mpsc::unbounded_channel();
+        (
+            Shell {
+                events_log_lost: false,
+                server_submission_lost: false,
+                config: ShellConfig {
+                    host: "127.0.0.1".into(),
+                    port: 1,
+                    engine_path: std::env::current_exe().expect("test executable"),
+                    engine_args: Vec::new(),
+                    engine_dir: None,
+                    log_dir: PathBuf::new(),
+                    quit_grace: Duration::from_millis(100),
+                    redact: Vec::new(),
+                },
+                start: Instant::now(),
+                event_tx,
+                log_tx,
+                server_write: None,
+                server_reader: None,
+                server_generation: 1,
+                connector: None,
+                engine_writer: None,
+                engine_readers: Vec::new(),
+                retired_engines: Vec::new(),
+                engine_cleanup_failed: Arc::new(AtomicBool::new(false)),
+                child: None,
+                engine_generation: 1,
+                probe: None,
+            },
+            events,
+            logs,
+        )
+    }
+
+    #[tokio::test]
+    async fn short_writes_preserve_frames_and_fifo_without_replay() {
+        use tokio::io::AsyncReadExt as _;
+        let (mut shell, _events, mut logs) = test_shell();
+        let (write, mut read) = tokio::io::duplex(1);
+        shell.server_write = Some(spawn_line_writer(
+            write,
+            shell.event_tx.clone(),
+            shell.log_tx.clone(),
+            shell.start,
+            WriterTarget::Server(1),
+        ));
+        for line in ["position startpos", "go btime 1", "stop", ""] {
+            shell.write_server(line).expect("enqueue");
+        }
+        let expected = b"position startpos\ngo btime 1\nstop\n\n";
+        let mut actual = vec![0; expected.len()];
+        tokio::time::timeout(Duration::from_secs(1), read.read_exact(&mut actual))
+            .await
+            .expect("drain deadline")
+            .expect("read");
+        assert_eq!(actual, expected);
+        shell.stop_server_reader().await;
+        let mut complete = Vec::new();
+        while let Ok(LogLine::Wire { raw, .. }) = logs.try_recv() {
+            complete.push(raw);
+        }
+        assert_eq!(complete, ["position startpos", "go btime 1", "stop", ""]);
+    }
+
+    #[tokio::test]
+    async fn blocked_server_queue_overflow_does_not_disconnect_or_replay() {
+        use tokio::io::AsyncReadExt as _;
+        let (mut shell, mut events, _logs) = test_shell();
+        let (write, mut read) = tokio::io::duplex(1);
+        shell.server_write = Some(spawn_line_writer(
+            write,
+            shell.event_tx.clone(),
+            shell.log_tx.clone(),
+            shell.start,
+            WriterTarget::Server(1),
+        ));
+        for _ in 0..WRITE_QUEUE_CAPACITY {
+            shell.write_server("critical").expect("bounded queue");
+        }
+        shell.write_server("").expect("congested keepalive skipped");
+        assert!(!shell.execute(vec![Action::SendServer(rsshogi_csa::CsaCommand::Logout)]));
+        assert!(shell.server_submission_lost);
+        assert!(shell.server_write.is_some(), "overflow must preserve the socket writer");
+        assert!(matches!(
+            events.try_recv(),
+            Ok(Incoming::Event(Event::Operator { command: OperatorCommand::StopAfterGame, .. }))
+        ));
+        assert!(events.try_recv().is_err(), "overflow must not synthesize EOF");
+        let expected = "critical\n".repeat(WRITE_QUEUE_CAPACITY);
+        let mut actual = vec![0; expected.len()];
+        tokio::time::timeout(Duration::from_secs(1), read.read_exact(&mut actual))
+            .await
+            .expect("drain deadline")
+            .expect("read");
+        assert_eq!(actual, expected.as_bytes());
+        shell.stop_server_reader().await;
+    }
+
+    #[tokio::test]
+    async fn elapsed_deadline_preempts_info_backlog_and_old_socket_events() {
+        let (mut shell, mut events, _logs) = test_shell();
+        shell
+            .event_tx
+            .send(Incoming::Server { generation: 0, event: Event::ServerEof { at: 0 } })
+            .unwrap();
+        for _ in 0..1000 {
+            shell
+                .event_tx
+                .send(Incoming::EngineLine { at: 0, generation: 1, line: "info nodes 1".into() })
+                .unwrap();
+        }
+        assert!(matches!(shell.next_event(&mut events, Some(0)).await, Some(Event::Tick { .. })));
+        assert!(matches!(
+            shell.next_event(&mut events, None).await,
+            Some(Event::EngineLine { .. })
+        ));
+        shell.cancel_server();
+    }
+
+    #[tokio::test]
+    async fn retired_cleanup_failure_survives_completed_handle_pruning() {
+        let (mut shell, _events, _logs) = test_shell();
+        // Model an already-completed failed reap. A subsequent engine restart
+        // prunes that handle, but its failure must still affect final status.
+        let failed = shell.engine_cleanup_failed.clone();
+        let task = tokio::spawn(async move {
+            failed.store(true, Ordering::Relaxed);
+            Err(io::Error::other("simulated retired-child reap failure"))
+        });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        shell.retired_engines.push(task);
+        shell.retire_engine();
+        assert_eq!(shell.retired_engines.len(), 1, "completed handle was pruned");
+        let error = shell.stop_engine().await.expect_err("retired failure cannot become success");
+        assert!(error.to_string().contains("retired engine"));
+    }
+
+    #[tokio::test]
+    async fn enqueue_errors_never_include_login_or_option_payloads() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.try_send("already queued".into()).unwrap();
+        let writer = LineWriter { tx, task: tokio::spawn(async {}) };
+        let login = "LOGIN user super-secret-password";
+        let full = enqueue(Some(&writer), login).unwrap_err();
+        assert_eq!(full.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(full.to_string(), "outbound queue full");
+        assert!(!full.to_string().contains("super-secret-password"));
+        rx.close();
+        let closed =
+            enqueue(Some(&writer), "setoption name Token value private-token").unwrap_err();
+        assert_eq!(closed.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(closed.to_string(), "outbound queue closed");
+        assert!(!closed.to_string().contains("private-token"));
+        writer.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn writer_failure_reports_its_own_engine_generation() {
+        let (shell, mut events, _logs) = test_shell();
+        let (write, read) = tokio::io::duplex(1);
+        drop(read);
+        let writer = spawn_line_writer(
+            write,
+            shell.event_tx.clone(),
+            shell.log_tx.clone(),
+            shell.start,
+            WriterTarget::Engine(7),
+        );
+        enqueue(Some(&writer), "go").unwrap();
+        writer.task.await.unwrap();
+        let incoming = events.recv().await.unwrap();
+        assert!(matches!(&incoming, Incoming::EngineGone { generation: 7, .. }));
+        assert!(incoming.for_generation(8).is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unread_real_child_shutdown_includes_quit_write_in_grace() {
+        let (mut shell, _events, mut logs) = test_shell();
+        shell.config.engine_args = vec![
+            "--ignored".into(),
+            "--exact".into(),
+            "shell::tests::unread_child".into(),
+            "--nocapture".into(),
+        ];
+        shell.spawn_engine().unwrap();
+        shell.write_engine(&"x".repeat(8 * 1024 * 1024)).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let start = Instant::now();
+        tokio::time::timeout(Duration::from_millis(700), shell.stop_engine())
+            .await
+            .expect("quit write and child wait must share grace")
+            .expect("direct child reaped");
+        assert!(start.elapsed() < Duration::from_millis(600));
+        assert!(shell.child.is_none());
+        assert!(shell.engine_writer.is_none());
+        assert!(shell.engine_readers.is_empty());
+        let mut reaped = false;
+        while let Ok(line) = logs.try_recv() {
+            if let LogLine::Engine { raw, .. } = line {
+                reaped |= raw.contains("killed; exit status:");
+            }
+        }
+        assert!(reaped, "log must prove the direct child was reaped before success");
+    }
+
+    #[test]
+    #[ignore = "child used by unread pipe shutdown test"]
+    fn unread_child() {
+        loop {
+            std::thread::park();
+        }
+    }
+
+    #[test]
+    fn old_engine_output_cannot_reach_the_new_generation() {
+        for line in ["bestmove 7g7f", "readyok", "usiok", "info score cp 300"] {
+            assert!(Incoming::EngineLine { at: 1, generation: 1, line: line.into() }
+                .for_generation(2)
+                .is_none());
+            assert_eq!(
+                Incoming::EngineLine { at: 1, generation: 2, line: line.into() }.for_generation(2),
+                Some(Event::EngineLine { at: 1, line: line.into() })
+            );
+        }
+        assert!(Incoming::EngineGone { at: 1, generation: 1 }.for_generation(2).is_none());
+    }
 
     /// Two runs started in the same millisecond must not share a log.
     ///

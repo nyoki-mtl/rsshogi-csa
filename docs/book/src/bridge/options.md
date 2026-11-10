@@ -58,11 +58,24 @@
 | --- | --- | --- |
 | `--margin-ms N` | `2500` | engine に申告する自分の時間から差し引く安全 margin |
 | `--stop-grace-ms N` | `1000` | `stop` 後に `bestmove` を待つ時間 |
+| `--usi-timeout-ms N` | `30000` | engineごとのusiok応答期限 |
+| `--ready-timeout-ms N` | `300000` | GPU準備を含むreadyok応答期限 |
+| `--login-timeout-ms N` | `30000` | LOGIN応答期限。成功後の組合せ待ちは無期限 |
 | `--keepalive-ms N` | `40000` | 空行 keepalive の間隔。30 秒未満は 30 秒へ切り上げ |
 | `--resign-cp N` | `0` | この score より良い投了を alert にする閾値 |
 | `--max-degraded-moves N` | `2` | engine が答えられなかった連続手数の上限 |
 | `--any-legal-on-panic` | off | fallback が尽きたとき投了でなく任意の合法手を指す |
 | `--quit-grace-secs N` | `6` | `quit` 後に engine の終了を待つ時間 |
+
+`--stop-grace-ms`は`--margin-ms`未満にする必要があります。
+stopが遅れても、手番開始から計算したfallback期限は延長しません。
+準備期限の3設定は正の整数で指定します。
+接続試行は1回30秒、LOGIN成功まで最大3回です。
+quitの書込み待ちも終了猶予に含みます。
+
+`--x1 --game-name NAME`では、初回と継続する各局の終了後に一度ずつ登録します。
+game nameなしでは大会側からのsummaryを待ち、追加登録しません。
+非x1も接続維持で継続でき、正常終局後のEOFでは残り局数があれば再接続します。
 
 ### 持時間0秒のFischer対局
 
@@ -73,7 +86,9 @@
 既定の`--margin-ms 2500`では探索時間が残らず、engineへの`binc`も0になります。
 
 この形式の大会では`--margin-ms`を2000未満に設定し、実際の接続先、network、engineで
-余裕を確認してください。bridgeはmarginがその手の全予算を消費すると
+余裕を確認してください。
+その際は`--stop-grace-ms`もmargin未満に調整してください。
+bridgeはmarginがその手の全予算を消費すると
 `margin_exhausts_budget` alertを記録します。
 
 `--resign-cp` は投了の可否を変えません。

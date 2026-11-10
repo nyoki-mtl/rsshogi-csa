@@ -55,6 +55,13 @@ pub struct BridgeConfig {
     pub margin_ms: u64,
     /// How long to wait for a `bestmove` after sending `stop`.
     pub stop_grace_ms: u64,
+    /// Maximum wait for `usiok`, per engine process (default: 30 seconds).
+    pub usi_timeout_ms: u64,
+    /// Maximum wait for `readyok`, including GPU preparation (default: 5 minutes).
+    pub ready_timeout_ms: u64,
+    /// Maximum wait for the LOGIN response (default: 30 seconds).
+    /// Pairing after a successful LOGIN has no such timeout.
+    pub login_timeout_ms: u64,
     /// Blank-line keepalive interval. The CSA rule is a 30 second minimum.
     pub keepalive_interval_ms: u64,
     /// The score above which `bestmove resign` is worth an alert.
@@ -102,6 +109,9 @@ impl BridgeConfig {
             engine_options: Vec::new(),
             margin_ms: 2_500,
             stop_grace_ms: 1_000,
+            usi_timeout_ms: 30_000,
+            ready_timeout_ms: 300_000,
+            login_timeout_ms: 30_000,
             keepalive_interval_ms: 40_000,
             resign_threshold_cp: 0,
             max_degraded_moves: 2,
@@ -134,6 +144,20 @@ impl BridgeConfig {
             .iter()
             .find(|(name, _)| name == "USI_Ponder")
             .is_none_or(|(_, value)| value.eq_ignore_ascii_case("true"))
+    }
+
+    /// Checks deadline settings before starting an engine or opening a socket.
+    ///
+    /// The grace must leave part of the margin for transmission. This is an
+    /// arithmetic constraint, not a qualification of network latency.
+    pub const fn validate(&self) -> Result<(), &'static str> {
+        if self.stop_grace_ms >= self.margin_ms {
+            return Err("stop_grace_ms must be less than margin_ms");
+        }
+        if self.usi_timeout_ms == 0 || self.ready_timeout_ms == 0 || self.login_timeout_ms == 0 {
+            return Err("usi_timeout_ms, ready_timeout_ms and login_timeout_ms must be positive");
+        }
+        Ok(())
     }
 
     /// The keepalive interval, never below the protocol's 30 second floor.

@@ -99,6 +99,18 @@ struct Args {
     #[arg(long, default_value_t = 1_000)]
     stop_grace_ms: u64,
 
+    /// Maximum wait for usiok, per engine process.
+    #[arg(long, default_value_t = 30_000)]
+    usi_timeout_ms: u64,
+
+    /// Maximum wait for readyok, including GPU preparation.
+    #[arg(long, default_value_t = 300_000)]
+    ready_timeout_ms: u64,
+
+    /// Maximum wait for LOGIN response; successful pairing waits are unlimited.
+    #[arg(long, default_value_t = 30_000)]
+    login_timeout_ms: u64,
+
     /// Blank-line keepalive interval. The protocol floor is 30 seconds.
     #[arg(long, default_value_t = 40_000)]
     keepalive_ms: u64,
@@ -194,6 +206,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     config.engine_options = engine_options;
     config.margin_ms = args.margin_ms;
     config.stop_grace_ms = args.stop_grace_ms;
+    config.usi_timeout_ms = args.usi_timeout_ms;
+    config.ready_timeout_ms = args.ready_timeout_ms;
+    config.login_timeout_ms = args.login_timeout_ms;
+    config.validate()?;
     config.keepalive_interval_ms = args.keepalive_ms;
     config.resign_threshold_cp = args.resign_cp;
     config.max_degraded_moves = args.max_degraded_moves;

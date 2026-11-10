@@ -233,9 +233,12 @@ stdin の `resign` / `stop` / `quit`。検証しない。そのまま実行す�
 ## Disconnection Is a Loss (0007)
 
 `shogi-server` は対局中の切断を `GameResultAbnormalWin` として扱い、切断側に `%TORYO / #RESIGN / #LOSE` を送る。
-再接続による継続は存在しない。
+対局中の再接続による同じ対局の継続は存在しない。
 
-したがって「再接続とバックオフ」ではなく「ソケットを絶対に落とさない」設計に予算を振る。
+したがって対局中はソケットを保持する設計を優先する。
+正常終局後のEOFでは、残り局数があれば同じbridgeプロセスで再接続する。
+非x1でも接続が維持される場合は次summaryを待ち、明示終了でLOGOUTを送る。
+現行の期限、writer分離、次局登録、未対応時計の契約は[対局期限と接続の契約](bridge-reliability.md)に記す。
 
 - socket task が TCP stream を排他所有し、エンジン I/O とログでブロックしない
 - session core は `unwrap` / `expect` を持たず panic-free に保つ
@@ -481,3 +484,12 @@ phase は `state` が既に答えている。二重の真実を作らない。
 - Python bindings
 - `Protocol_Mode:Direct`。`shogi-server` も ShogiHome も実装していない
 - このリポジトリでの観戦 UI の作り直し。0011 で手放した。読む側は ShogiArena に置く
+
+## 失効探索の排出と世代境界
+
+shellはstdout入力にも起動世代を保持し、旧世代のbestmove、readyok、infoを新世代のコアへ渡さない。
+終局や投了で対局状態を破棄しても、未完のUSI探索は返答待ちとして保持する。
+旧bestmoveを排出するまで次局のUSI設定とgoを保留し、応答がなければstop_grace後に既存の上限内でエンジンを交換する。
+失効探索のinfoは評価蓄積やfallbackに使わず、通常探索の有効なPVだけを縮退候補として扱う。
+元の手番の期限は交換後のウォームアップ中も保持し、再開時のUSI本時間から経過分を引き、不足分も秒読みまたは自分側の加算から引く。
+観戦用の[探索文脈付きプローブ](probe-logging.md)は独立した有界writerへ出力し、対局イベントを高頻度infoで増やさない。
