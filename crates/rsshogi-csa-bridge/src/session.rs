@@ -36,8 +36,9 @@ use crate::config::{usi_entering_king_rule, BridgeConfig, PanicPolicy, HEARTBEAT
 use crate::game_state::{entering_king_rule_for, GameState};
 use crate::probe::{info_body, ProbeRecord, SearchContext};
 use crate::record::{
-    AlertCode, AlertLevel, EngineOption, EvalRecord, GameResult, LogRecord, Millis, MoveOrigin,
-    MoveRecord, Phase, PlayerNames, PonderOutcome, RecordBody, Side, TimeSummary,
+    AlertCode, AlertLevel, ConnectionEvent, EngineOption, EvalRecord, GameResult, LogRecord,
+    Millis, MoveOrigin, MoveRecord, Phase, PlayerNames, PonderOutcome, ProposalEndReason,
+    RecordBody, Side, TimeSummary,
 };
 use serde_json::json;
 
@@ -78,6 +79,13 @@ pub enum Event {
         /// Monotonic time.
         at: Millis,
     },
+    /// The log writer committed a terminal record and its completion index.
+    LogCommitted {
+        /// Monotonic time.
+        at: Millis,
+        /// Source sequence of the committed `game_end` or `proposal_end`.
+        seq: u64,
+    },
     /// A scheduled wakeup, or any wakeup at all.
     Tick {
         /// Monotonic time.
@@ -103,6 +111,7 @@ impl Event {
             | Self::Connected { at }
             | Self::ServerLine { at, .. }
             | Self::ServerEof { at }
+            | Self::LogCommitted { at, .. }
             | Self::Tick { at }
             | Self::Operator { at, .. } => *at,
         }
@@ -200,6 +209,9 @@ struct Search {
 
 /// The mate scale the engines report internally, and what these records use.
 const MATE_SCORE: i32 = 32_000;
+
+/// Maximum wait for terminal log completion before admitting another game.
+const LOG_COMPLETION_TIMEOUT_MS: Millis = 5_000;
 
 /// The opponent move a ponder search is betting on.
 ///
@@ -314,6 +326,12 @@ pub struct SessionCore {
     game_id: Option<String>,
     entering_king_rule: Option<EnteringKingRule>,
     engine_restarts: u32,
+    engine_spawn_generation: u64,
+    proposal_game_id: Option<String>,
+    log_completion_barrier: bool,
+    pending_log_seq: Option<u64>,
+    pending_log_deadline: Option<Millis>,
+    deferred_summary: Option<GameSummary>,
 
     /// `id name` / `id author`, collected between `usi` and `usiok`.
     engine_id_name: Option<String>,
@@ -333,6 +351,7 @@ pub struct SessionCore {
     server_prepare_deadline: Option<Millis>,
     registration_pending: bool,
     proposal_pending: bool,
+    local_reject_pending: bool,
     connect_attempts: u32,
     generation: u64,
     want_go: bool,
@@ -392,6 +411,12 @@ impl SessionCore {
             game_id: None,
             entering_king_rule: None,
             engine_restarts: 0,
+            engine_spawn_generation: 0,
+            proposal_game_id: None,
+            log_completion_barrier: false,
+            pending_log_seq: None,
+            pending_log_deadline: None,
+            deferred_summary: None,
             engine_id_name: None,
             engine_id_author: None,
             engine_meta_logged: false,
@@ -406,6 +431,7 @@ impl SessionCore {
             server_prepare_deadline: None,
             registration_pending: false,
             proposal_pending: false,
+            local_reject_pending: false,
             connect_attempts: 0,
             generation: 0,
             want_go: false,
@@ -428,6 +454,15 @@ impl SessionCore {
         }
     }
 
+    /// Require terminal log completion before registering or accepting another game.
+    ///
+    /// The shell enables this before starting the session and supplies
+    /// [`Event::LogCommitted`] after the terminal record and its index are flushed.
+    /// Sans-I/O consumers retain the original admission behavior unless enabled.
+    pub const fn enable_log_completion_barrier(&mut self) {
+        self.log_completion_barrier = true;
+    }
+
     /// When the core next wants to be woken, as monotonic milliseconds.
     ///
     /// The shell recomputes this after every [`SessionCore::step`]. A wakeup
@@ -439,6 +474,7 @@ impl SessionCore {
             return None;
         }
         let mut best = merge_deadline(self.engine_prepare_deadline, self.server_prepare_deadline);
+        best = merge_deadline(best, self.pending_log_deadline);
         if self.want_go {
             best = merge_deadline(best, self.turn_deadline);
         }
@@ -485,6 +521,7 @@ impl SessionCore {
         // An answer exactly at the boundary is accepted before checking timers.
         if self.engine_prepare_deadline.is_some_and(|end| at > end)
             || self.server_prepare_deadline.is_some_and(|end| at > end)
+            || self.pending_log_deadline.is_some_and(|end| at > end)
         {
             let engine_event =
                 matches!(event, Event::EngineLine { .. } | Event::EngineExited { .. });
@@ -515,8 +552,22 @@ impl SessionCore {
             Event::Connected { at } => self.on_connected(at, out),
             Event::ServerLine { at, line } => self.on_server_line(at, &line, out),
             Event::ServerEof { at } => self.on_server_eof(at, out),
+            Event::LogCommitted { at, seq } => self.on_log_committed(at, seq, out),
             Event::Tick { at } => self.on_tick(at, out),
             Event::Operator { at, command } => self.on_operator(at, command, out),
+        }
+    }
+
+    fn on_log_committed(&mut self, at: Millis, seq: u64, out: &mut Vec<Action>) {
+        if self.pending_log_seq != Some(seq) {
+            return;
+        }
+        self.pending_log_seq = None;
+        self.pending_log_deadline = None;
+        if let Some(summary) = self.deferred_summary.take() {
+            self.on_summary(at, summary, out);
+        } else {
+            self.maybe_register(at, out);
         }
     }
 
@@ -556,7 +607,7 @@ impl SessionCore {
             out,
         );
         self.log(at, RecordBody::State { phase: Phase::Warming }, out);
-        out.push(Action::SpawnEngine);
+        self.spawn_engine(at, out);
         self.emit_probe(at, json!({"type":"engine","event":"starting"}), out);
         out.push(Action::SendEngine(UsiCommand::Usi));
         self.engine = EnginePhase::Handshaking;
@@ -618,7 +669,7 @@ impl SessionCore {
             self.engine_restarts, self.config.max_engine_restarts
         );
         self.alert(at, AlertLevel::Warn, AlertCode::EngineRestarted, &detail, out);
-        out.push(Action::SpawnEngine);
+        self.spawn_engine(at, out);
         self.emit_probe(at, json!({"type":"engine","event":"starting"}), out);
         out.push(Action::SendEngine(UsiCommand::Usi));
         self.engine = EnginePhase::Handshaking;
@@ -845,6 +896,7 @@ impl SessionCore {
     // ---- server --------------------------------------------------------
 
     fn on_connected(&mut self, at: Millis, out: &mut Vec<Action>) {
+        self.connection(at, ConnectionEvent::Connected, out);
         self.connected = true;
         self.last_server_send_at = at;
         self.server = ServerPhase::LoggingIn;
@@ -884,6 +936,7 @@ impl SessionCore {
     fn on_server_command(&mut self, at: Millis, command: CsaCommand, out: &mut Vec<Action>) {
         match command {
             CsaCommand::LoginOk { .. } => {
+                self.connection(at, ConnectionEvent::LoginAccepted, out);
                 self.connect_attempts = 0;
                 self.server_prepare_deadline = None;
                 self.server = ServerPhase::Waiting;
@@ -892,22 +945,29 @@ impl SessionCore {
                 self.maybe_register(at, out);
             }
             CsaCommand::LoginIncorrect => {
+                self.connection(at, ConnectionEvent::LoginRejected, out);
                 self.alert(at, AlertLevel::Error, AlertCode::LoginFailed, "login refused", out);
                 self.shutdown(at, "login refused", out);
             }
             CsaCommand::BeginGameSummary => {
                 self.registration_pending = false;
                 self.proposal_pending = true;
+                self.proposal_game_id = None;
                 self.server = ServerPhase::ReadingSummary;
                 self.reader = Some(GameSummaryReader::new());
                 self.summary_failure = None;
                 self.feed_summary(at, "BEGIN Game_Summary", out);
             }
             CsaCommand::RejectNotice { by, .. } => {
-                if !self.proposal_pending {
+                if !self.proposal_pending && !self.local_reject_pending {
                     return;
                 }
-                self.proposal_pending = false;
+                self.end_proposal(
+                    at,
+                    ProposalEndReason::Rejected,
+                    Some(format!("proposal rejected by {by}")),
+                    out,
+                );
                 self.alert(
                     at,
                     AlertLevel::Warn,
@@ -934,10 +994,19 @@ impl SessionCore {
     }
 
     fn feed_summary(&mut self, at: Millis, line: &str, out: &mut Vec<Action>) {
+        if let Some(game_id) = line.strip_prefix("Game_ID:") {
+            self.proposal_game_id = Some(game_id.to_owned());
+        }
         if self.summary_failure.is_some() {
             if line.trim() == "END Game_Summary" {
                 if let Some(detail) = self.summary_failure.take() {
-                    self.reject_proposal(at, None, &detail, out);
+                    self.reject_proposal(
+                        at,
+                        None,
+                        &detail,
+                        ProposalEndReason::ValidationRejected,
+                        out,
+                    );
                 }
             }
             return;
@@ -953,7 +1022,13 @@ impl SessionCore {
                 self.alert(at, AlertLevel::Warn, AlertCode::UnreadableServerLine, &detail, out);
                 self.reader = None;
                 if line.trim() == "END Game_Summary" {
-                    self.reject_proposal(at, None, &detail, out);
+                    self.reject_proposal(
+                        at,
+                        None,
+                        &detail,
+                        ProposalEndReason::ValidationRejected,
+                        out,
+                    );
                 } else {
                     self.summary_failure = Some(detail);
                 }
@@ -976,11 +1051,19 @@ impl SessionCore {
         at: Millis,
         game_id: Option<String>,
         detail: &str,
+        reason: ProposalEndReason,
         out: &mut Vec<Action>,
     ) {
+        if game_id.is_some() {
+            self.proposal_game_id.clone_from(&game_id);
+        }
+        self.end_proposal(at, reason, Some(detail.to_owned()), out);
         self.alert(at, AlertLevel::Error, AlertCode::UnusableProposal, detail, out);
         self.send_server(at, CsaCommand::Reject { game_id }, out);
         self.reset_game(at, out);
+        // The local termination is already logged, but the server still owes
+        // REJECT before explicit x1 registration is safe again.
+        self.local_reject_pending = true;
         self.server = ServerPhase::Waiting;
         if !self.should_continue() {
             self.shutdown(at, "proposal unusable and no further game requested", out);
@@ -988,70 +1071,36 @@ impl SessionCore {
     }
 
     fn on_summary(&mut self, at: Millis, summary: GameSummary, out: &mut Vec<Action>) {
+        self.proposal_game_id.clone_from(&summary.game_id);
         if self.stop_after_game {
-            self.reject_proposal(at, summary.game_id.clone(), "stopped before agreeing", out);
+            self.reject_proposal(
+                at,
+                summary.game_id.clone(),
+                "stopped before agreeing",
+                ProposalEndReason::StopRequested,
+                out,
+            );
             return;
         }
-        if let Err(detail) = validate_proposal(&summary) {
-            self.reject_proposal(at, summary.game_id.clone(), &detail, out);
+        if self.pending_log_seq.is_some() {
+            self.deferred_summary = Some(summary);
             return;
         }
-
         let rule =
             self.config.entering_king_rule.unwrap_or_else(|| entering_king_rule_for(&summary));
-        let game_id = summary.game_id.clone();
-        let mut game = match GameState::from_summary(&summary, rule) {
-            Ok(game) => game,
-            Err(err) => {
-                self.reject_proposal(at, game_id, &err.to_string(), out);
+        let (game, replayed_records) = match game_from_proposal(&summary, rule) {
+            Ok(prepared) => prepared,
+            Err(detail) => {
+                self.reject_proposal(
+                    at,
+                    summary.game_id.clone(),
+                    &detail,
+                    ProposalEndReason::ValidationRejected,
+                    out,
+                );
                 return;
             }
         };
-
-        if [Color::Black, Color::White]
-            .into_iter()
-            .any(|color| game.ledger().budget(color) == MoveBudget::Unlimited)
-        {
-            self.reject_proposal(at, game_id, "time-unlimited games are not supported", out);
-            return;
-        }
-
-        let (_, replayed) = summary.position_split();
-        let mut replayed_records = Vec::new();
-        for raw in replayed {
-            let Ok(CsaCommand::Move(line)) = parse_line(raw) else {
-                self.reject_proposal(at, game_id, raw, out);
-                return;
-            };
-            match game.apply_csa_move(line.csa.as_str(), line.elapsed.unwrap_or(0)) {
-                Ok(played) => {
-                    replayed_records.push(move_record(&played, MoveOrigin::Replayed, None));
-                }
-                Err(err) => {
-                    self.reject_proposal(at, game_id, &err.to_string(), out);
-                    return;
-                }
-            }
-        }
-
-        // `To_Move` states whose turn it is once those moves are in. If our board
-        // disagrees, the two of us are looking at different games, and every move
-        // we send from here is an illegal move. It is the one free check on the
-        // whole replay, so it is worth taking.
-        if let Some(declared) = summary.to_move {
-            if declared != game.side_to_move() {
-                let detail = format!(
-                    "`To_Move:{declared}` but the position block leaves `{}` to move",
-                    game.side_to_move()
-                );
-                self.reject_proposal(at, game_id, &detail, out);
-                return;
-            }
-        }
-
-        // The declared remaining time describes the clock after those moves, so
-        // it is applied last and wins over what replay computed.
-        game.sync_declared_remaining(&summary);
 
         self.game_id.clone_from(&summary.game_id);
         self.entering_king_rule = Some(rule);
@@ -1188,6 +1237,13 @@ impl SessionCore {
     }
 
     fn on_server_eof(&mut self, at: Millis, out: &mut Vec<Action>) {
+        self.connection(at, ConnectionEvent::Disconnected, out);
+        self.end_proposal(at, ProposalEndReason::Disconnected, None, out);
+        let had_proposal = self.game.is_some()
+            || self.reader.is_some()
+            || self.summary_failure.is_some()
+            || self.deferred_summary.is_some()
+            || self.local_reject_pending;
         self.connected = false;
         self.server_prepare_deadline = None;
         self.registration_pending = false;
@@ -1206,6 +1262,9 @@ impl SessionCore {
             self.reset_game(at, out);
             self.shutdown(at, "connection closed during a game", out);
             return;
+        }
+        if had_proposal {
+            self.reset_game(at, out);
         }
         if self.should_continue() {
             if self.connect_attempts >= 3 {
@@ -1234,7 +1293,9 @@ impl SessionCore {
             }
             OperatorCommand::StopAfterGame => {
                 self.stop_after_game = true;
-                if self.game.is_none() && self.server != ServerPhase::ReadingSummary {
+                if let Some(summary) = self.deferred_summary.take() {
+                    self.on_summary(at, summary, out);
+                } else if self.game.is_none() && self.server != ServerPhase::ReadingSummary {
                     self.shutdown(at, "no game remains to finish", out);
                 }
             }
@@ -1680,6 +1741,11 @@ impl SessionCore {
     }
 
     fn check_deadlines(&mut self, at: Millis, out: &mut Vec<Action>) {
+        if self.pending_log_deadline.is_some_and(|end| at >= end) {
+            self.stop_after_game = true;
+            self.shutdown(at, "event log completion timed out", out);
+            return;
+        }
         if self.server_prepare_deadline.is_some_and(|end| at >= end) {
             self.server_prepare_deadline = None;
             self.alert(
@@ -1847,6 +1913,8 @@ impl SessionCore {
             || !self.should_continue()
             || self.search.is_some()
             || self.engine != EnginePhase::Ready
+            || self.pending_log_seq.is_some()
+            || self.local_reject_pending
         {
             return;
         }
@@ -1902,9 +1970,14 @@ impl SessionCore {
         self.probe_search(at, "discarded", "discarded", Some("game_reset"), out);
         self.reader = None;
         self.summary_failure = None;
+        self.deferred_summary = None;
         self.game = None;
         self.summary = None;
         self.game_id = None;
+        self.game_start_seq = 0;
+        self.proposal_pending = false;
+        self.local_reject_pending = false;
+        self.proposal_game_id = None;
         // Whatever was running still owes a `bestmove`, which will arrive after
         // the game is gone.
         self.game_setup_pending = false;
@@ -1931,6 +2004,7 @@ impl SessionCore {
         if self.closed {
             return;
         }
+        self.end_proposal(at, ProposalEndReason::SessionShutdown, Some(reason.to_owned()), out);
         // The protocol asks for an explicit `LOGOUT` rather than a bare
         // disconnect, but only while the connection is still ours to leave. We
         // do not wait for `LOGOUT:completed`: the shell queues this line and
@@ -1953,10 +2027,64 @@ impl SessionCore {
 
     // ---- logging -------------------------------------------------------
 
+    fn spawn_engine(&mut self, at: Millis, out: &mut Vec<Action>) {
+        self.engine_spawn_generation = self.engine_spawn_generation.saturating_add(1);
+        self.log_with_game_id(
+            at,
+            None,
+            RecordBody::EngineGeneration { generation: self.engine_spawn_generation },
+            out,
+        );
+        out.push(Action::SpawnEngine);
+    }
+
+    fn connection(&mut self, at: Millis, event: ConnectionEvent, out: &mut Vec<Action>) {
+        self.log_with_game_id(at, None, RecordBody::Connection { event }, out);
+    }
+
+    fn end_proposal(
+        &mut self,
+        at: Millis,
+        reason: ProposalEndReason,
+        detail: Option<String>,
+        out: &mut Vec<Action>,
+    ) {
+        if !self.proposal_pending && self.game.is_none() {
+            return;
+        }
+        self.log(
+            at,
+            RecordBody::ProposalEnd {
+                game_start_seq: (self.game_start_seq != 0).then_some(self.game_start_seq),
+                proposal_game_id: self.proposal_game_id.clone(),
+                reason,
+                detail,
+            },
+            out,
+        );
+        self.proposal_pending = false;
+    }
+
     fn log(&mut self, at: Millis, body: RecordBody, out: &mut Vec<Action>) {
+        self.log_with_game_id(at, self.game_id.clone(), body, out);
+    }
+
+    fn log_with_game_id(
+        &mut self,
+        at: Millis,
+        game_id: Option<String>,
+        body: RecordBody,
+        out: &mut Vec<Action>,
+    ) {
         self.seq = self.seq.saturating_add(1);
         self.last_log_at = at;
-        out.push(Action::Log(LogRecord { seq: self.seq, game_id: self.game_id.clone(), at, body }));
+        if self.log_completion_barrier
+            && matches!(body, RecordBody::GameEnd { .. } | RecordBody::ProposalEnd { .. })
+        {
+            self.pending_log_seq = Some(self.seq);
+            self.pending_log_deadline = Some(at.saturating_add(LOG_COMPLETION_TIMEOUT_MS));
+        }
+        out.push(Action::Log(LogRecord { seq: self.seq, game_id, at, body }));
     }
 
     fn alert(
@@ -1969,6 +2097,45 @@ impl SessionCore {
     ) {
         self.log(at, RecordBody::Alert { level, code, detail: detail.to_owned() }, out);
     }
+}
+
+/// Validate and replay a proposal before exposing any accepted-game state.
+fn game_from_proposal(
+    summary: &GameSummary,
+    rule: EnteringKingRule,
+) -> Result<(GameState, Vec<MoveRecord>), String> {
+    validate_proposal(summary)?;
+    let mut game = GameState::from_summary(summary, rule).map_err(|err| err.to_string())?;
+    if [Color::Black, Color::White]
+        .into_iter()
+        .any(|color| game.ledger().budget(color) == MoveBudget::Unlimited)
+    {
+        return Err("time-unlimited games are not supported".to_owned());
+    }
+    let (_, replayed) = summary.position_split();
+    let mut replayed_records = Vec::new();
+    for raw in replayed {
+        let Ok(CsaCommand::Move(line)) = parse_line(raw) else {
+            return Err(raw.to_owned());
+        };
+        let played = game
+            .apply_csa_move(line.csa.as_str(), line.elapsed.unwrap_or(0))
+            .map_err(|err| err.to_string())?;
+        replayed_records.push(move_record(&played, MoveOrigin::Replayed, None));
+    }
+    // `To_Move` describes the position after replay; a mismatch would make
+    // every subsequent move use the wrong board.
+    if let Some(declared) = summary.to_move {
+        if declared != game.side_to_move() {
+            return Err(format!(
+                "`To_Move:{declared}` but the position block leaves `{}` to move",
+                game.side_to_move()
+            ));
+        }
+    }
+    // Declared remaining time applies after replay and overrides its charges.
+    game.sync_declared_remaining(summary);
+    Ok((game, replayed_records))
 }
 
 fn validate_proposal(summary: &GameSummary) -> Result<(), String> {

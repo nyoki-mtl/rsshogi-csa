@@ -18,6 +18,12 @@ bridge は起動ごとに millisecond epoch を run ID として取り、同じ 
 
 ## JSONL event log
 
+0.3.0向けの実装では、既存runログに加えて`<run_id>-split/`へセッション共通events、対局別events、一覧と形式識別manifestを出力します。
+旧consumerは引き続き直下の`*-events.jsonl`を読みます。
+新consumerは分割形式を明示選択し、旧runログとの混合補完を行いません。
+対局IDの再利用は`game_start_seq`と0始まりの絶対添字で区別し、結果とファイル完結は別に記録します。
+engineとprobeはrun共通のままです。
+
 event log は 1 行 1 JSON record です。
 
 既存 field の意味を変えず、新しい情報は record type または field の追加で表します。

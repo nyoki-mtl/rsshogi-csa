@@ -211,10 +211,61 @@ pub enum Phase {
     Closing,
 }
 
+/// Why a proposal or active game ended without a normal result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProposalEndReason {
+    /// Local validation rejected the proposal.
+    ValidationRejected,
+    /// Stopping was requested before agreement.
+    StopRequested,
+    /// The server reported rejection.
+    Rejected,
+    /// The connection ended.
+    Disconnected,
+    /// The session shut down.
+    SessionShutdown,
+}
+
+/// An observed connection or login fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionEvent {
+    /// The socket opened.
+    Connected,
+    /// Login succeeded.
+    LoginAccepted,
+    /// Login failed.
+    LoginRejected,
+    /// The connection ended.
+    Disconnected,
+}
+
 /// One entry in the event log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RecordBody {
+    /// A proposal or active game ended without a normal `game_end`.
+    ProposalEnd {
+        /// Actual `game_start` sequence, absent before local acceptance.
+        game_start_seq: Option<u64>,
+        /// Proposed identifier, including proposals that were rejected locally.
+        proposal_game_id: Option<String>,
+        /// Typed termination cause.
+        reason: ProposalEndReason,
+        /// Diagnostic context; wording is not stable.
+        detail: Option<String>,
+    },
+    /// An engine spawn was requested, including replacement attempts.
+    EngineGeneration {
+        /// Per-run spawn attempt number, starting at one.
+        generation: u64,
+    },
+    /// A session-level connection fact, independent of an active game.
+    Connection {
+        /// Connection or login event.
+        event: ConnectionEvent,
+    },
     /// The bridge started.
     BridgeStart {
         /// Bridge version.
@@ -410,6 +461,9 @@ mod tests {
     /// event log carries player names and the engine's local path. The shapes
     /// match what floodgate produced on 2026-08-04.
     const WIRE_LINES: &[&str] = &[
+        r#"{"at":0,"detail":null,"game_id":null,"game_start_seq":null,"proposal_game_id":"rejected-id","reason":"validation_rejected","schema":1,"seq":1,"ts":1785844602042,"type":"proposal_end"}"#,
+        r#"{"at":0,"game_id":null,"generation":1,"schema":1,"seq":1,"ts":1785844602042,"type":"engine_generation"}"#,
+        r#"{"at":0,"event":"connected","game_id":null,"schema":1,"seq":1,"ts":1785844602042,"type":"connection"}"#,
         r#"{"at":0,"engine_cmd":"/opt/engine/bin/engine","game_id":null,"schema":1,"seq":1,"ts":1785844602042,"type":"bridge_start","version":"0.1.0"}"#,
         r#"{"at":0,"game_id":null,"phase":"warming","schema":1,"seq":2,"ts":1785844602042,"type":"state"}"#,
         r#"{"at":199630,"entering_king_rule":"CSARule27","game_id":"server+testgame+alice+bob+20260804210004","initial_sfen":"lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL b - 1","max_moves":512,"moves_so_far":[],"my_color":"black","names":{"black":"alice","white":"bob"},"schema":1,"seq":5,"time":{"byoyomi_ms":0,"inc_ms":10000,"least_ms":0,"roundup":false,"total_ms":300000,"unit_ms":1000},"ts":1785844801673,"type":"game_start"}"#,
@@ -471,6 +525,8 @@ mod tests {
                 "alert",
                 "bridge_start",
                 "bridge_stop",
+                "connection",
+                "engine_generation",
                 "engine_meta",
                 "game_end",
                 "game_start",
@@ -478,6 +534,7 @@ mod tests {
                 "heartbeat",
                 "move",
                 "ponder",
+                "proposal_end",
                 "state",
             ]
         );

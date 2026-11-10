@@ -9,6 +9,38 @@ use tokio::net::TcpListener;
 
 const SUMMARY: &str = "BEGIN Game_Summary\nProtocol_Version:1.2\nProtocol_Mode:Server\nFormat:Shogi 1.0\nDeclaration:Jishogi 1.1\nGame_ID:blocked-pipe\nName+:us\nName-:them\nYour_Turn:+\nRematch_On_Draw:NO\nTo_Move:+\nMax_Moves:256\nBEGIN Time\nTime_Unit:1sec\nTotal_Time:1\nByoyomi:1\nIncrement:0\nLeast_Time_Per_Move:0\nEND Time\nBEGIN Position\nPI\n+\nEND Position\nEND Game_Summary\n";
 
+#[test]
+fn runtime_shutdown_does_not_wait_for_open_operator_stdin() {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "unread_child_pipe_allows_fallback_terminal_and_bounded_shutdown",
+            "--nocapture",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Keep the write side alive and send neither a line nor EOF until after exit.
+    let open_stdin = child.stdin.take().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(12);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            assert!(status.success(), "child test failed: {status}");
+            break;
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            panic!("runtime waited for operator stdin after shell shutdown");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(open_stdin);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unread_child_pipe_allows_fallback_terminal_and_bounded_shutdown() {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("listen");

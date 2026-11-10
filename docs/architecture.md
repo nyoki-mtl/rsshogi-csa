@@ -212,6 +212,10 @@ CSA ではサーバーが `#SENNICHITE` などを送る。
 
 stdin の `resign` / `stop` / `quit`。検証しない。そのまま実行する。
 
+stdinは名前付きの独立OS threadで読み、Tokioのblocking poolへ載せない。
+stdinの同期readはキャンセルできないため、終了時にそのthreadをjoinせず、入力pipeが開いたままでもruntimeとCLIプロセスを終了できるようにする。
+threadの作成失敗は対局受付前のエラーとして返す。
+
 オペレーターはブリッジにもエンジンにも見えない情報を持っている。
 大会本部の指示、機材の異常、次の対局に間に合わせる判断。
 根拠を要求できる立場ではないので、規則 A1 / A2 は適用しない。
@@ -493,3 +497,13 @@ shellはstdout入力にも起動世代を保持し、旧世代のbestmove、read
 失効探索のinfoは評価蓄積やfallbackに使わず、通常探索の有効なPVだけを縮退候補として扱う。
 元の手番の期限は交換後のウォームアップ中も保持し、再開時のUSI本時間から経過分を引き、不足分も秒読みまたは自分側の加算から引く。
 観戦用の[探索文脈付きプローブ](probe-logging.md)は独立した有界writerへ出力し、対局イベントを高頻度infoで増やさない。
+
+## セッション共通eventsと対局別events
+
+0.3.0向けに[分割eventsの契約](split-event-logs.md)を追加した。
+旧runログは維持し、独立した有界writerが専用子ディレクトリへsession、対局events、追記専用indexを出す。
+提案終了をtyped eventで記録し、対局ID再利用はgame_start_seqと絶対添字で区別する。
+game_endとfile_completeは分離し、追記先を外して閉じた後にだけ完結通知をflushする。
+次局受付は非同期の完結応答を最大5秒待つが、現在局の期限処理とengine排出は待たせない。
+分割側の障害でも旧run writerと現在局を継続し、独立経路で通知して次局を抑止する。
+通常eventとprobeの採番は統合せず、engine/probeの物理分割は後続段階とする。

@@ -5,6 +5,27 @@
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-10
+
+### Added
+
+- 旧runログを維持したまま、`<run>-split/`へセッション共通events、対局別events、追記専用の一覧とmanifestを追加出力する。
+- `proposal_end`、`engine_generation`、`connection`をeventsへ追加し、提案終了と置換後の世代を明示する。
+- 一覧は0始まりの対局添字、game_start_seq、提案状態、結果、writerによるファイル完結を独立に保持する。
+- Rust APIに`split_log`の型と`read_index_prefix`、`Event::LogCommitted`、対局間の完結確認ゲートを追加した。
+
+### Changed
+
+- CLIは分割出力を既定で併記する。旧consumerは直下のrunログを継続して読み、新consumerはmanifestで形式を明示選択する。
+- 分割eventsでも元のseqとenvelopeを保持する。probeは独立採番と既存の探索文脈を維持し、engine/probeの物理分割は行わない。
+- criticalな追加出力や一覧の失敗時は旧runログと現在局を継続し、独立した障害通知で次局を抑止する。
+- 対局間の次局受付はwriterの完結通知を最大5秒待つ。着手処理、keepalive、engineの排出は非同期のまま進める。
+- codecの型とparse/formatは維持し、両crateのversionを0.3.0へ揃える。
+
+### Fixed
+
+- operator入力のstdin読取をTokioのblocking poolから独立したthreadへ移し、入力pipeが開いたままでもruntime終了を待たせないようにした。
+
 ## [0.2.1] - 2026-11-10
 
 ### Fixed

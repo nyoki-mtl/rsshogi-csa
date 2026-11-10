@@ -38,6 +38,7 @@ use tokio::task::JoinHandle;
 use crate::probe::ProbeWriter;
 use crate::record::{LogRecord, Millis};
 use crate::session::{Action, Event, OperatorCommand, SessionCore};
+use crate::split_log::{FramedEvent, SplitWriter};
 
 /// Where the shell connects, what it runs, and where it writes.
 #[derive(Debug, Clone)]
@@ -131,23 +132,29 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
     // Nothing is lost by refusing to start; a game played with no record is a
     // game the operator cannot see, audit, or trust.
     let (run_id, files) = create_log_files(&config.log_dir).await?;
+    let (critical_tx, critical_rx) = mpsc::unbounded_channel();
+    let (committed_tx, committed_rx) = mpsc::unbounded_channel();
+    let split =
+        SplitWriter::start(&config.log_dir, run_id, critical_tx.clone(), committed_tx).await?;
     let probe = ProbeWriter::start(&config.log_dir, run_id, config.redact.clone()).await;
     // The id the dashboard keys on. Printed because it is no longer guessable
     // from the clock now that it carries milliseconds and may have been bumped.
     eprintln!("run {run_id}: logging to {}", config.log_dir.display());
     let (log_tx, log_rx) = mpsc::unbounded_channel();
     let redact = config.redact.clone();
-    let writer = tokio::spawn(writer_task(log_rx, files, redact));
+    let writer = tokio::spawn(writer_task(log_rx, files, redact, Some(split), critical_tx));
 
     let (event_tx, mut event_rx) = mpsc::unbounded_channel();
     let start = Instant::now();
-    spawn_operator_reader(event_tx.clone(), start);
+    spawn_operator_reader(event_tx.clone(), start)?;
 
     let mut shell = Shell {
         config,
         start,
         event_tx,
-        events_log_lost: false,
+        critical_log_failed: false,
+        critical_rx,
+        committed_rx,
         server_submission_lost: false,
         log_tx,
         server_write: None,
@@ -163,6 +170,7 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
         probe,
     };
 
+    core.enable_log_completion_barrier();
     let actions = core.step(Event::Started { at: shell.now() });
     let mut done = shell.execute(actions);
 
@@ -181,7 +189,7 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
 
     let engine_cleanup_result = shell.stop_engine().await;
     shell.stop_server_reader().await;
-    let events_log_lost = shell.events_log_lost;
+    let critical_log_failed = shell.critical_log_failed;
     let server_submission_lost = shell.server_submission_lost;
     if let Some(probe) = shell.probe.take() {
         probe.finish().await;
@@ -197,7 +205,7 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
         Err(err) => Err(io::Error::other(format!("log writer panicked: {err}"))),
     };
     if let Err(err) = writer_result {
-        eprintln!("FATAL: the event log writer failed: {err}");
+        eprintln!("FATAL: critical event logging failed: {err}");
         return Err(err);
     }
     engine_cleanup_result?;
@@ -206,15 +214,15 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
             "a critical CSA command could not be queued; this run lost an outbound submission",
         ));
     }
-    if events_log_lost {
+    if critical_log_failed {
         return Err(io::Error::other(
-            "the event log writer failed; this run is not fully recorded",
+            "a critical event log or index failed; this run is not fully recorded",
         ));
     }
     Ok(())
 }
 
-/// The events log is gone and the operator has been told once.
+/// A critical event output failed and the operator has been told once.
 ///
 /// `対局を落とさないことが最優先` protects the game *in progress*, and it says
 /// nothing about games not yet begun. So the current game plays to its end — no
@@ -224,7 +232,9 @@ pub async fn run(mut core: SessionCore, config: ShellConfig) -> io::Result<()> {
 /// coming silence as 異常終了) is bounded at one game, and by then it is nearly
 /// true: the bridge is in terminal wind-down.
 struct Shell {
-    events_log_lost: bool,
+    critical_log_failed: bool,
+    critical_rx: mpsc::UnboundedReceiver<()>,
+    committed_rx: mpsc::UnboundedReceiver<u64>,
     server_submission_lost: bool,
     config: ShellConfig,
     start: Instant,
@@ -248,20 +258,20 @@ impl Shell {
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 
-    /// The events writer died. Finish this game, then stop taking pairings.
+    /// A critical output failed. Finish this game, then stop taking pairings.
     ///
     /// Reported on stderr and through a nonzero exit, because those are the
     /// operator channels that cannot die with the file. The previous code
     /// dropped this failure twice — the send result and the writer's `JoinHandle`
     /// were both discarded — so the bridge played on with no log at all and
     /// nothing anywhere said so.
-    fn on_events_log_lost(&mut self) {
-        if self.events_log_lost {
+    fn on_critical_log_failure(&mut self) {
+        if self.critical_log_failed {
             return;
         }
-        self.events_log_lost = true;
+        self.critical_log_failed = true;
         eprintln!(
-            "FATAL: the event log writer failed; this game will be finished and no further \
+            "FATAL: a critical event log or index failed; this game will be finished and no further \
              pairing will be accepted"
         );
         let _ = self.event_tx.send(Incoming::Event(Event::Operator {
@@ -276,8 +286,26 @@ impl Shell {
         deadline: Option<Millis>,
     ) -> Option<Event> {
         loop {
+            if self.critical_rx.try_recv().is_ok() {
+                self.on_critical_log_failure();
+                return Some(Event::Operator {
+                    at: self.now(),
+                    command: OperatorCommand::StopAfterGame,
+                });
+            }
+            if let Ok(seq) = self.committed_rx.try_recv() {
+                return Some(Event::LogCommitted { at: self.now(), seq });
+            }
             let incoming = match deadline {
-                None => rx.recv().await?,
+                None => tokio::select! {
+                    biased;
+                    Some(()) = self.critical_rx.recv() => {
+                        self.on_critical_log_failure();
+                        return Some(Event::Operator { at: self.now(), command: OperatorCommand::StopAfterGame });
+                    }
+                    Some(seq) = self.committed_rx.recv() => return Some(Event::LogCommitted { at: self.now(), seq }),
+                    incoming = rx.recv() => incoming?,
+                },
                 Some(deadline) => {
                     if deadline <= self.now() {
                         return Some(Event::Tick { at: self.now() });
@@ -285,6 +313,11 @@ impl Shell {
                     let remaining = Duration::from_millis(deadline.saturating_sub(self.now()));
                     tokio::select! {
                         biased;
+                        Some(()) = self.critical_rx.recv() => {
+                            self.on_critical_log_failure();
+                            return Some(Event::Operator { at: self.now(), command: OperatorCommand::StopAfterGame });
+                        }
+                        Some(seq) = self.committed_rx.recv() => return Some(Event::LogCommitted { at: self.now(), seq }),
                         () = tokio::time::sleep(remaining) => {
                             return Some(Event::Tick { at: self.now() });
                         }
@@ -355,7 +388,7 @@ impl Shell {
                 }
                 Action::Log(record) => {
                     if self.log_tx.send(LogLine::Record(Box::new(record))).is_err() {
-                        self.on_events_log_lost();
+                        self.on_critical_log_failure();
                     }
                 }
                 Action::Probe(record) => {
@@ -787,27 +820,37 @@ fn epoch_millis() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
-fn spawn_operator_reader(tx: mpsc::UnboundedSender<Incoming>, start: Instant) {
-    tokio::spawn(async move {
-        let mut lines = BufReader::new(tokio::io::stdin()).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            let command = match line.trim() {
-                "resign" => OperatorCommand::Resign,
-                "stop" | "stop-after-game" => OperatorCommand::StopAfterGame,
-                "quit" => OperatorCommand::Quit,
-                other => {
-                    if !other.is_empty() {
-                        eprintln!("unknown operator command: `{other}` (resign / stop / quit)");
-                    }
-                    continue;
+fn spawn_operator_reader(tx: mpsc::UnboundedSender<Incoming>, start: Instant) -> io::Result<()> {
+    use std::io::BufRead as _;
+    // Stdin reads cannot be cancelled. Keep them outside Tokio's blocking pool
+    // so runtime shutdown never joins a read waiting for terminal input or EOF.
+    std::thread::Builder::new()
+        .name("csabridge-stdin".into())
+        .spawn(move || {
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                let Ok(line) = line else { return };
+                if tx.is_closed() {
+                    return;
                 }
-            };
-            let operator = Event::Operator { at: elapsed_ms(start), command };
-            if tx.send(Incoming::Event(operator)).is_err() {
-                return;
+                let command = match line.trim() {
+                    "resign" => OperatorCommand::Resign,
+                    "stop" | "stop-after-game" => OperatorCommand::StopAfterGame,
+                    "quit" => OperatorCommand::Quit,
+                    other => {
+                        if !other.is_empty() {
+                            eprintln!("unknown operator command: `{other}` (resign / stop / quit)");
+                        }
+                        continue;
+                    }
+                };
+                let operator = Event::Operator { at: elapsed_ms(start), command };
+                if tx.send(Incoming::Event(operator)).is_err() {
+                    return;
+                }
             }
-        }
-    });
+        })
+        .map(|_| ())
 }
 
 /// Owns the three log files so no write can stall the event loop.
@@ -871,60 +914,269 @@ async fn writer_task(
     mut rx: mpsc::UnboundedReceiver<LogLine>,
     files: LogFiles,
     redact: Vec<String>,
+    split: Option<SplitWriter>,
+    critical: mpsc::UnboundedSender<()>,
 ) -> io::Result<()> {
     let LogFiles { mut events, mut wire, mut engine } = files;
     let mut wire_alive = true;
     let mut engine_alive = true;
 
-    while let Some(line) = rx.recv().await {
-        match line {
-            LogLine::Record(record) => {
-                let mut value = serde_json::to_value(&*record)
-                    .unwrap_or_else(|_| serde_json::json!({"type": "unserializable"}));
-                if let Some(object) = value.as_object_mut() {
-                    object.insert("schema".to_owned(), serde_json::json!(1));
-                    object.insert("ts".to_owned(), serde_json::json!(epoch_millis()));
+    let legacy_result = async {
+        while let Some(line) = rx.recv().await {
+            match line {
+                LogLine::Record(record) => {
+                    let mut value = serde_json::to_value(&*record)
+                        .unwrap_or_else(|_| serde_json::json!({"type": "unserializable"}));
+                    if let Some(object) = value.as_object_mut() {
+                        object.insert("schema".to_owned(), serde_json::json!(1));
+                        object.insert("ts".to_owned(), serde_json::json!(epoch_millis()));
+                    }
+                    let mut bytes = value.to_string().into_bytes();
+                    bytes.push(b'\n');
+                    events.write_all(&bytes).await?;
+                    events.flush().await?;
+                    if let Some(split) = &split {
+                        split.submit(FramedEvent { record: *record, bytes });
+                    }
                 }
-                events.write_all(value.to_string().as_bytes()).await?;
-                events.write_all(b"\n").await?;
-                events.flush().await?;
-            }
-            // The wire and engine logs are diagnostics, not the published
-            // contract, so they do not share the events log's fate: losing them
-            // is worth saying out loud and nothing more. Only the events log can
-            // stop the bridge taking another pairing.
-            LogLine::Wire { at, dir, raw } => {
-                let masked = redact
-                    .iter()
-                    .filter(|secret| !secret.is_empty())
-                    .fold(raw, |line, secret| line.replace(secret.as_str(), "*****"));
-                let text = format!("{at} {} {masked}\n", dir.as_str());
-                if let Err(err) = write_line(&mut wire, text.as_bytes()).await {
-                    report_degraded(&mut wire_alive, "wire.log", &err);
+                // The wire and engine logs are diagnostics, not the published
+                // contract, so they do not share the events log's fate: losing them
+                // is worth saying out loud and nothing more. Only the events log can
+                // stop the bridge taking another pairing.
+                LogLine::Wire { at, dir, raw } => {
+                    let masked = redact
+                        .iter()
+                        .filter(|secret| !secret.is_empty())
+                        .fold(raw, |line, secret| line.replace(secret.as_str(), "*****"));
+                    let text = format!("{at} {} {masked}\n", dir.as_str());
+                    if let Err(err) = write_line(&mut wire, text.as_bytes()).await {
+                        report_degraded(&mut wire_alive, "wire.log", &err);
+                    }
                 }
-            }
-            LogLine::Engine { at, dir, raw } => {
-                let text = format!("{at} {} {raw}\n", dir.as_str());
-                if let Err(err) = write_line(&mut engine, text.as_bytes()).await {
-                    report_degraded(&mut engine_alive, "engine.log", &err);
+                LogLine::Engine { at, dir, raw } => {
+                    let text = format!("{at} {} {raw}\n", dir.as_str());
+                    if let Err(err) = write_line(&mut engine, text.as_bytes()).await {
+                        report_degraded(&mut engine_alive, "engine.log", &err);
+                    }
                 }
             }
         }
+        Ok::<(), io::Error>(())
     }
-    Ok(())
+    .await;
+    if legacy_result.is_err() {
+        let _ = critical.send(());
+    }
+    let split_result = if let Some(split) = split { split.finish().await } else { Ok(()) };
+    legacy_result?;
+    split_result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn record_step(
+        core: &mut SessionCore,
+        event: Event,
+        tx: &mpsc::UnboundedSender<LogLine>,
+    ) -> Vec<Action> {
+        let actions = core.step(event);
+        for action in &actions {
+            if let Action::Log(record) = action {
+                tx.send(LogLine::Record(Box::new(record.clone()))).unwrap();
+            }
+        }
+        actions
+    }
+
+    #[tokio::test]
+    async fn terminal_index_failure_never_releases_next_registration_and_legacy_finishes() {
+        let dir = std::env::temp_dir().join(format!(
+            "rsshogi-csa-terminal-index-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        tokio::fs::create_dir(&dir).await.unwrap();
+        let (run_id, files) = create_log_files(&dir).await.unwrap();
+        let (critical, failure_rx) = mpsc::unbounded_channel();
+        let (committed, committed_rx) = mpsc::unbounded_channel();
+        let split =
+            SplitWriter::with_terminal_index_failure(&dir, run_id, critical.clone(), committed)
+                .await
+                .unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(writer_task(rx, files, Vec::new(), Some(split), critical));
+        let mut config = crate::config::BridgeConfig::floodgate("us", "secret");
+        config.x1 = true;
+        config.game_name = Some("test".into());
+        config.games = 0;
+        let mut core = SessionCore::new(config, "engine", "test");
+        core.enable_log_completion_barrier();
+        for event in [
+            Event::Started { at: 0 },
+            Event::EngineLine { at: 0, line: "usiok".into() },
+            Event::EngineLine { at: 0, line: "readyok".into() },
+            Event::Connected { at: 0 },
+            Event::ServerLine { at: 0, line: "LOGIN:us OK".into() },
+        ] {
+            record_step(&mut core, event, &tx);
+        }
+        for line in include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../rsshogi-csa/tests/summaries/floodgate-proposal.txt"
+        ))
+        .lines()
+        {
+            record_step(&mut core, Event::ServerLine { at: 0, line: line.into() }, &tx);
+        }
+        record_step(&mut core, Event::ServerLine { at: 0, line: "START:test".into() }, &tx);
+        record_step(&mut core, Event::EngineLine { at: 0, line: "bestmove 7g7f".into() }, &tx);
+        let ended = record_step(&mut core, Event::ServerLine { at: 0, line: "#WIN".into() }, &tx);
+        assert!(
+            !ended.iter().any(|a| matches!(a, Action::SendServer(_))),
+            "registration must wait for writer completion"
+        );
+        let (mut shell, mut events, _unused) = test_shell();
+        shell.critical_rx = failure_rx;
+        shell.committed_rx = committed_rx;
+        let failed =
+            tokio::time::timeout(Duration::from_secs(3), shell.next_event(&mut events, None))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(failed, Event::Operator { command: OperatorCommand::StopAfterGame, .. }));
+        let shutdown = record_step(&mut core, failed, &tx);
+        assert!(shutdown.iter().any(|a| matches!(a, Action::Shutdown { .. })));
+        assert!(!shutdown
+            .iter()
+            .any(|a| matches!(a, Action::SendServer(rsshogi_csa::CsaCommand::Meta(_)))));
+        drop(tx);
+        assert!(writer.await.unwrap().is_err());
+        let legacy =
+            tokio::fs::read_to_string(dir.join(format!("{run_id}-events.jsonl"))).await.unwrap();
+        assert!(legacy.contains("game_end"));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(legacy.lines().last().unwrap()).unwrap()
+                ["type"],
+            "bridge_stop"
+        );
+        let index = crate::split_log::read_index_prefix(
+            &tokio::fs::read(dir.join(format!("{run_id}-split/games.jsonl"))).await.unwrap(),
+        )
+        .unwrap();
+        let Some(crate::split_log::IndexRecord::Game(last)) = index.records.last() else {
+            panic!("game snapshot")
+        };
+        assert_eq!(last.result, Some(crate::record::GameResult::Win));
+        assert!(!last.file_complete);
+        assert_eq!(dir.parent(), Some(std::env::temp_dir().as_path()));
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn index_write_failure_notifies_independently_and_legacy_keeps_writing() {
+        let dir = std::env::temp_dir().join(format!(
+            "rsshogi-csa-index-failure-{}-{}",
+            std::process::id(),
+            epoch_millis()
+        ));
+        tokio::fs::create_dir(&dir).await.unwrap();
+        let (run_id, files) = create_log_files(&dir).await.unwrap();
+        let (critical, mut failures) = mpsc::unbounded_channel();
+        let split =
+            SplitWriter::with_read_only_index(&dir, run_id, critical.clone()).await.unwrap();
+        let (tx, rx) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(writer_task(rx, files, Vec::new(), Some(split), critical));
+        let start = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/csa-event-log-contract.jsonl"
+        ))
+        .lines()
+        .find_map(|line| {
+            let record: LogRecord = serde_json::from_str(line).unwrap();
+            matches!(record.body, crate::record::RecordBody::GameStart { .. })
+                .then_some(record.body)
+        })
+        .unwrap();
+        let make = |seq, body| {
+            LogLine::Record(Box::new(LogRecord {
+                seq,
+                at: seq,
+                game_id: Some("test".into()),
+                body,
+            }))
+        };
+        tx.send(make(1, start)).unwrap();
+        tokio::time::timeout(Duration::from_secs(3), failures.recv()).await.unwrap().unwrap();
+        // The index has failed at the OS write, while the old writer still owns
+        // a live receiver and accepts the current game's remaining records.
+        tx.send(make(2, crate::record::RecordBody::State { phase: crate::record::Phase::Playing }))
+            .unwrap();
+        tx.send(make(
+            3,
+            crate::record::RecordBody::GameEnd {
+                result: crate::record::GameResult::Lose,
+                terminal: vec!["#LOSE".into()],
+                black_remaining_ms: 0,
+                white_remaining_ms: 0,
+            },
+        ))
+        .unwrap();
+        tx.send(make(4, crate::record::RecordBody::BridgeStop)).unwrap();
+        drop(tx);
+        assert!(writer.await.unwrap().is_err());
+        let bytes =
+            tokio::fs::read_to_string(dir.join(format!("{run_id}-events.jsonl"))).await.unwrap();
+        let records: Vec<serde_json::Value> =
+            bytes.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(records.len(), 4);
+        assert_eq!(records.last().unwrap()["type"], "bridge_stop");
+        let index = tokio::fs::read(dir.join(format!("{run_id}-split/games.jsonl"))).await.unwrap();
+        assert!(crate::split_log::read_index_prefix(&index).unwrap().records.is_empty());
+        assert_eq!(dir.parent(), Some(std::env::temp_dir().as_path()));
+        tokio::fs::remove_dir_all(dir).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn critical_log_failure_preempts_queued_new_proposals() {
+        let (mut shell, mut events, _logs) = test_shell();
+        let (failure, rx) = mpsc::unbounded_channel();
+        shell.critical_rx = rx;
+        shell
+            .event_tx
+            .send(Incoming::Event(Event::ServerLine { at: 0, line: "BEGIN Game_Summary".into() }))
+            .unwrap();
+        failure.send(()).unwrap();
+        assert!(matches!(
+            shell.next_event(&mut events, None).await,
+            Some(Event::Operator { command: OperatorCommand::StopAfterGame, .. })
+        ));
+        assert!(shell.critical_log_failed);
+        let mut core = SessionCore::new(
+            crate::config::BridgeConfig::floodgate("us", "secret"),
+            "engine",
+            "test",
+        );
+        core.step(Event::Started { at: 0 });
+        let stop = core.step(Event::Operator { at: 0, command: OperatorCommand::StopAfterGame });
+        assert!(stop.iter().any(|action| matches!(action, Action::Shutdown { .. })));
+        assert!(core
+            .step(Event::ServerLine { at: 1, line: "BEGIN Game_Summary".into() })
+            .is_empty());
+    }
+
     fn test_shell() -> (Shell, mpsc::UnboundedReceiver<Incoming>, mpsc::UnboundedReceiver<LogLine>)
     {
         let (event_tx, events) = mpsc::unbounded_channel();
         let (log_tx, logs) = mpsc::unbounded_channel();
+        let (_, critical_rx) = mpsc::unbounded_channel();
+        let (_, committed_rx) = mpsc::unbounded_channel();
         (
             Shell {
-                events_log_lost: false,
+                critical_log_failed: false,
+                critical_rx,
+                committed_rx,
                 server_submission_lost: false,
                 config: ShellConfig {
                     host: "127.0.0.1".into(),
@@ -1212,7 +1464,9 @@ mod tests {
             let run_id = epoch_millis();
             let files = open_run_files(&dir, run_id).await.expect("log files");
             let (tx, rx) = mpsc::unbounded_channel();
-            let writer = tokio::spawn(writer_task(rx, files, vec!["secret".to_owned()]));
+            let (critical, _) = mpsc::unbounded_channel();
+            let writer =
+                tokio::spawn(writer_task(rx, files, vec!["secret".to_owned()], None, critical));
             tx.send(LogLine::Wire {
                 at: 0,
                 dir: WireDir::Out,

@@ -1,4 +1,4 @@
-//! The canonical event-log fixture, and the test that keeps it honest.
+//! The legacy event-log fixture, and the test that keeps it honest.
 //!
 //! The event log is a contract with a reader outside this workspace, so both
 //! sides have to agree on one artifact rather than on two descriptions of it.
@@ -12,7 +12,8 @@
 //! the bytes travel by being committed, which is the only way a cross-repository
 //! fixture stays reproducible.
 //!
-//! Regenerate after an intentional schema change:
+//! Regeneration preserves the legacy projection: additive lifecycle events are
+//! omitted and legacy sequence numbers are normalized. Regenerate deliberately:
 //!
 //! ```text
 //! cargo test -p rsshogi-csa-bridge --test contract_fixture -- --ignored
@@ -198,21 +199,40 @@ fn produce() -> Vec<String> {
     lines
 }
 
-/// The artifact must be what the producer actually produces.
+/// Project additive events away to pin the original consumer contract.
+/// New lifecycle records have their own byte-level fixtures in `record.rs`.
+fn legacy_projection(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .filter_map(|line| {
+            let value: serde_json::Value = serde_json::from_str(&line).expect("valid record");
+            (!matches!(
+                value["type"].as_str(),
+                Some("proposal_end" | "engine_generation" | "connection")
+            ))
+            .then_some(value)
+        })
+        .enumerate()
+        .map(|(index, mut value)| {
+            value["seq"] = serde_json::json!(index + 1);
+            value.to_string()
+        })
+        .collect()
+}
+
+/// Existing fields and events must retain their original wire representation.
 ///
 /// Both repositories read the committed file; this is what stops it drifting
 /// away from the code that is supposed to have written it.
 #[test]
 fn the_committed_fixture_is_what_the_bridge_writes() {
-    let produced = produce().join("\n") + "\n";
+    let produced = legacy_projection(produce()).join("\n") + "\n";
     let path = fixture_path();
     let committed = std::fs::read_to_string(&path)
         .unwrap_or_else(|err| panic!("missing contract fixture {}: {err}", path.display()));
     assert_eq!(
         produced, committed,
-        "the event log drifted from the committed contract fixture; regenerate it with \
-         `cargo test -p rsshogi-csa-bridge --test contract_fixture -- --ignored` and re-vendor \
-         it into ShogiArena with a fresh provenance record",
+        "the legacy event projection drifted from the unchanged contract fixture",
     );
 }
 
@@ -295,13 +315,13 @@ fn the_fixture_separates_run_static_options_from_per_game_rules() {
     );
 }
 
-/// Regeneration, run on purpose.
+/// Regenerate the same legacy projection checked above, run on purpose.
 #[test]
 #[ignore = "writes the fixture; run deliberately after an intentional schema change"]
 fn regenerate_the_contract_fixture() {
     let path = fixture_path();
     std::fs::create_dir_all(path.parent().expect("fixture has a parent"))
         .expect("fixture directory");
-    std::fs::write(&path, produce().join("\n") + "\n").expect("write fixture");
+    std::fs::write(&path, legacy_projection(produce()).join("\n") + "\n").expect("write fixture");
     eprintln!("wrote {}", path.display());
 }

@@ -6,6 +6,7 @@
 //! point of the session core being sans-I/O.
 
 use rsshogi_csa::format_command;
+use rsshogi_csa_bridge::record::{ConnectionEvent, ProposalEndReason};
 use rsshogi_csa_bridge::{
     Action, AlertCode, BridgeConfig, Event, GameResult, Millis, MoveOrigin, OperatorCommand, Phase,
     RecordBody, SessionCore, Side,
@@ -2105,4 +2106,461 @@ fn a_closed_bridge_stops_writing_heartbeats() {
         after_stop,
         "a log that ended with bridge_stop must not grow afterwards",
     );
+}
+
+fn proposal_ends(harness: &Harness) -> Vec<(Option<u64>, Option<String>, ProposalEndReason)> {
+    harness
+        .records()
+        .into_iter()
+        .filter_map(|body| match body {
+            RecordBody::ProposalEnd { game_start_seq, proposal_game_id, reason, .. } => {
+                Some((game_start_seq, proposal_game_id, reason))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn game_start_sequences(harness: &Harness) -> Vec<u64> {
+    harness
+        .log
+        .iter()
+        .filter_map(|action| match action {
+            Action::Log(record) if matches!(record.body, RecordBody::GameStart { .. }) => {
+                Some(record.seq)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn proposal_end_distinguishes_validation_rejection_and_reused_identifier() {
+    let mut harness = waiting_harness();
+    harness.summary(50, &PROPOSAL.replace("Protocol_Version:1.2", "Protocol_Version:1.1"));
+    let rejected = proposal_ends(&harness);
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].0, None);
+    assert_eq!(rejected[0].1.as_deref(), Some("test+floodgate-900-0+us+them+20260804120000"));
+    assert_eq!(rejected[0].2, ProposalEndReason::ValidationRejected);
+    assert!(game_start_sequences(&harness).is_empty());
+    harness.summary(60, PROPOSAL);
+    harness.server(70, "REJECT:test by them");
+    harness.server(71, "REJECT:test by them");
+    harness.summary(80, PROPOSAL);
+    harness.feed(Event::ServerEof { at: 90 });
+    let starts = game_start_sequences(&harness);
+    assert_eq!(starts.len(), 2);
+    assert!(starts[0] < starts[1]);
+    let ends = proposal_ends(&harness);
+    assert_eq!(ends.len(), 3);
+    assert_eq!(ends[1], (Some(starts[0]), rejected[0].1.clone(), ProposalEndReason::Rejected));
+    assert_eq!(ends[2], (Some(starts[1]), rejected[0].1.clone(), ProposalEndReason::Disconnected));
+}
+
+#[test]
+fn proposal_end_records_stop_before_agreement_without_a_game_start() {
+    let mut harness = waiting_harness();
+    for line in PROPOSAL.lines().take(PROPOSAL.lines().count() - 1) {
+        harness.server(50, line);
+    }
+    harness.feed(Event::Operator { at: 51, command: OperatorCommand::StopAfterGame });
+    harness.server(52, "END Game_Summary");
+    let ends = proposal_ends(&harness);
+    assert_eq!(ends.len(), 1);
+    assert_eq!(ends[0].0, None);
+    assert_eq!(ends[0].2, ProposalEndReason::StopRequested);
+    assert!(game_start_sequences(&harness).is_empty());
+}
+
+#[test]
+fn proposal_end_anchors_prestart_shutdown_and_playing_disconnect() {
+    for started in [false, true] {
+        for disconnect in [false, true] {
+            let mut harness = waiting_harness();
+            harness.summary(50, PROPOSAL);
+            if started {
+                harness.server(60, "START:test+floodgate-900-0+us+them+20260804120000");
+            }
+            let event = if disconnect {
+                Event::ServerEof { at: 70 }
+            } else {
+                Event::Operator { at: 70, command: OperatorCommand::Quit }
+            };
+            harness.feed(event);
+            let ends = proposal_ends(&harness);
+            assert_eq!(ends.len(), 1, "started={started}, disconnect={disconnect}");
+            assert_eq!(ends[0].0, Some(game_start_sequences(&harness)[0]));
+            assert_eq!(
+                ends[0].2,
+                if disconnect {
+                    ProposalEndReason::Disconnected
+                } else {
+                    ProposalEndReason::SessionShutdown
+                }
+            );
+            assert!(!harness
+                .records()
+                .iter()
+                .any(|body| matches!(body, RecordBody::GameEnd { .. })));
+        }
+    }
+}
+
+#[test]
+fn proposal_end_preserves_partial_summary_id_on_disconnect() {
+    let mut harness = waiting_harness();
+    harness.server(50, "BEGIN Game_Summary");
+    harness.server(51, "Game_ID:partial-id");
+    harness.feed(Event::ServerEof { at: 52 });
+    assert_eq!(
+        proposal_ends(&harness),
+        vec![(None, Some("partial-id".into()), ProposalEndReason::Disconnected)]
+    );
+    harness.summary(60, PROPOSAL);
+    harness.feed(Event::Operator { at: 61, command: OperatorCommand::Quit });
+    assert_eq!(proposal_ends(&harness).len(), 2);
+}
+
+#[test]
+fn normal_game_end_is_the_only_termination_even_after_disconnect_and_quit() {
+    let mut harness = Harness::new(forever_config());
+    harness.start_game(PROPOSAL);
+    harness.server(70, "#LOSE");
+    harness.feed(Event::ServerEof { at: 80 });
+    harness.feed(Event::Operator { at: 90, command: OperatorCommand::Quit });
+    assert!(proposal_ends(&harness).is_empty());
+    assert_eq!(
+        harness.records().iter().filter(|body| matches!(body, RecordBody::GameEnd { .. })).count(),
+        1
+    );
+}
+
+#[test]
+fn engine_spawn_generations_and_connection_records_have_session_envelopes() {
+    let mut settings = forever_config();
+    settings.max_engine_restarts = 3;
+    let mut harness = Harness::new(settings);
+    harness.start_game(PROPOSAL);
+    harness.feed(Event::EngineExited { at: 70 });
+    harness.engine(80, "usiok");
+    harness.engine(90, "readyok");
+    harness.feed(Event::EngineExited { at: 100 });
+    harness.feed(Event::ServerEof { at: 110 });
+    let mut generations = Vec::new();
+    let mut connections = Vec::new();
+    for action in &harness.log {
+        if let Action::Log(record) = action {
+            match record.body {
+                RecordBody::EngineGeneration { generation } => {
+                    assert!(record.game_id.is_none());
+                    generations.push(generation);
+                }
+                RecordBody::Connection { event } => {
+                    assert!(record.game_id.is_none());
+                    connections.push(event);
+                }
+                _ => {}
+            }
+        }
+    }
+    assert_eq!(generations, [1, 2, 3]);
+    assert_eq!(
+        generations.len(),
+        harness.log.iter().filter(|action| matches!(action, Action::SpawnEngine)).count()
+    );
+    assert_eq!(
+        connections,
+        [ConnectionEvent::Connected, ConnectionEvent::LoginAccepted, ConnectionEvent::Disconnected]
+    );
+    let start = game_start_sequences(&harness)[0];
+    assert_eq!(proposal_ends(&harness)[0].0, Some(start));
+}
+
+#[test]
+fn login_rejection_is_a_typed_session_connection_event() {
+    let mut harness = Harness::new(forever_config());
+    harness.feed(Event::Started { at: 0 });
+    harness.engine(10, "usiok");
+    harness.engine(20, "readyok");
+    harness.feed(Event::Connected { at: 30 });
+    let actions = harness.server(40, "LOGIN:incorrect");
+    assert!(actions.iter().any(|action| matches!(action, Action::Log(record)
+        if record.game_id.is_none() && matches!(record.body, RecordBody::Connection { event: ConnectionEvent::LoginRejected }))));
+    assert!(proposal_ends(&harness).is_empty());
+    let seqs: Vec<u64> = harness
+        .log
+        .iter()
+        .filter_map(|action| match action {
+            Action::Log(record) => Some(record.seq),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+}
+
+#[test]
+fn malformed_proposal_preserves_identifier_in_typed_validation_end() {
+    let mut harness = waiting_harness();
+    harness.summary(50, &PROPOSAL.replace("Total_Time:900", "Total_Time:invalid"));
+    assert_eq!(
+        proposal_ends(&harness),
+        vec![(
+            None,
+            Some("test+floodgate-900-0+us+them+20260804120000".into()),
+            ProposalEndReason::ValidationRejected
+        )]
+    );
+    harness.feed(Event::Operator { at: 60, command: OperatorCommand::Quit });
+    assert_eq!(proposal_ends(&harness).len(), 1);
+}
+
+fn barrier_harness() -> Harness {
+    let mut settings = forever_config();
+    settings.x1 = true;
+    settings.game_name = Some("barrier-test".into());
+    let mut harness = Harness::new(settings);
+    harness.core.enable_log_completion_barrier();
+    harness.start_game(PROPOSAL);
+    harness
+}
+
+fn terminal_sequence(harness: &Harness) -> u64 {
+    harness
+        .log
+        .iter()
+        .rev()
+        .find_map(|action| match action {
+            Action::Log(record)
+                if matches!(
+                    record.body,
+                    RecordBody::GameEnd { .. } | RecordBody::ProposalEnd { .. }
+                ) =>
+            {
+                Some(record.seq)
+            }
+            _ => None,
+        })
+        .expect("terminal source record")
+}
+
+fn finish_barrier_game(harness: &mut Harness) -> u64 {
+    harness.engine(65, "bestmove resign");
+    let ended = harness.server(70, "#LOSE");
+    assert!(!server_lines(&ended).iter().any(|line| line.starts_with("%%GAME")));
+    terminal_sequence(harness)
+}
+
+#[test]
+fn log_completion_barrier_waits_for_matching_terminal_sequence_before_registration() {
+    let mut harness = barrier_harness();
+    let terminal = finish_barrier_game(&mut harness);
+    assert_eq!(harness.core.next_deadline(), Some(5_070));
+    let wrong = harness.feed(Event::LogCommitted { at: 80, seq: terminal + 1 });
+    assert!(server_lines(&wrong).is_empty());
+    let committed = harness.feed(Event::LogCommitted { at: 90, seq: terminal });
+    assert_eq!(
+        server_lines(&committed).iter().filter(|line| line.starts_with("%%GAME")).count(),
+        1
+    );
+    assert!(harness.feed(Event::LogCommitted { at: 91, seq: terminal }).is_empty());
+}
+
+#[test]
+fn log_completion_barrier_holds_unsolicited_summary_until_acknowledgment() {
+    let mut harness = barrier_harness();
+    let terminal = finish_barrier_game(&mut harness);
+    let mark = harness.mark();
+    harness.summary(80, PROPOSAL);
+    assert!(server_lines(harness.since(mark)).is_empty());
+    assert_eq!(game_start_sequences(&harness).len(), 1);
+    harness.feed(Event::LogCommitted { at: 90, seq: terminal - 1 });
+    assert_eq!(game_start_sequences(&harness).len(), 1);
+    let committed = harness.feed(Event::LogCommitted { at: 100, seq: terminal });
+    assert!(server_lines(&committed).iter().any(|line| line.starts_with("AGREE")));
+    assert!(!server_lines(&committed).iter().any(|line| line.starts_with("%%GAME")));
+    assert_eq!(game_start_sequences(&harness).len(), 2);
+    assert!(committed.iter().any(|action| matches!(action, Action::Log(record)
+        if record.at == 100 && matches!(record.body, RecordBody::GameStart { .. }))));
+}
+
+#[test]
+fn log_completion_barrier_times_out_before_admitting_a_deferred_summary() {
+    for late_ack in [false, true] {
+        let mut harness = barrier_harness();
+        let terminal = finish_barrier_game(&mut harness);
+        harness.summary(80, PROPOSAL);
+        let expired = if late_ack {
+            harness.feed(Event::LogCommitted { at: 5_071, seq: terminal })
+        } else {
+            harness.tick(5_070)
+        };
+        assert!(expired.iter().any(|action| matches!(action, Action::Shutdown { reason }
+            if reason == "event log completion timed out")));
+        assert_eq!(game_start_sequences(&harness).len(), 1);
+        assert_eq!(
+            proposal_ends(&harness).last().map(|end| end.2),
+            Some(ProposalEndReason::SessionShutdown)
+        );
+        assert!(harness.feed(Event::LogCommitted { at: 5_072, seq: terminal }).is_empty());
+        assert_eq!(harness.core.next_deadline(), None);
+    }
+}
+
+#[test]
+fn log_completion_barrier_accepts_on_time_ack_and_times_out_without_deferred_summary() {
+    let mut harness = barrier_harness();
+    let terminal = finish_barrier_game(&mut harness);
+    let committed = harness.feed(Event::LogCommitted { at: 5_070, seq: terminal });
+    assert!(server_lines(&committed).iter().any(|line| line.starts_with("%%GAME")));
+    let mut harness = barrier_harness();
+    finish_barrier_game(&mut harness);
+    assert!(harness.tick(5_070).iter().any(|action| matches!(action, Action::Shutdown { .. })));
+    assert!(proposal_ends(&harness).is_empty());
+}
+
+#[test]
+fn log_completion_barrier_stop_after_game_cancels_deferred_summary_immediately() {
+    let mut harness = barrier_harness();
+    let terminal = finish_barrier_game(&mut harness);
+    harness.summary(80, PROPOSAL);
+    let stopped = harness.feed(Event::Operator { at: 90, command: OperatorCommand::StopAfterGame });
+    assert!(server_lines(&stopped).iter().any(|line| line.starts_with("REJECT")));
+    assert!(stopped.iter().any(|action| matches!(action, Action::Shutdown { .. })));
+    assert_eq!(
+        proposal_ends(&harness).last().map(|end| end.2),
+        Some(ProposalEndReason::StopRequested)
+    );
+    assert_eq!(game_start_sequences(&harness).len(), 1);
+    assert!(harness.feed(Event::LogCommitted { at: 100, seq: terminal }).is_empty());
+}
+
+#[test]
+fn log_completion_barrier_eof_discards_deferred_summary_and_ignores_old_ack() {
+    let mut harness = barrier_harness();
+    let terminal = finish_barrier_game(&mut harness);
+    harness.summary(80, PROPOSAL);
+    harness.feed(Event::ServerEof { at: 90 });
+    let disconnected = terminal_sequence(&harness);
+    assert_ne!(disconnected, terminal);
+    assert_eq!(
+        proposal_ends(&harness).last().map(|end| end.2),
+        Some(ProposalEndReason::Disconnected)
+    );
+    harness.feed(Event::Connected { at: 100 });
+    harness.server(110, "LOGIN:us OK");
+    assert!(harness.feed(Event::LogCommitted { at: 120, seq: terminal }).is_empty());
+    let committed = harness.feed(Event::LogCommitted { at: 130, seq: disconnected });
+    assert!(server_lines(&committed).iter().any(|line| line.starts_with("%%GAME")));
+    assert!(!server_lines(&committed).iter().any(|line| line.starts_with("AGREE")));
+    assert_eq!(game_start_sequences(&harness).len(), 1);
+}
+
+#[test]
+fn log_completion_barrier_waits_after_rejection_before_and_after_game_start() {
+    for accepted in [false, true] {
+        let mut harness = waiting_harness();
+        harness.core.enable_log_completion_barrier();
+        if accepted {
+            harness.summary(50, PROPOSAL);
+            harness.server(60, "REJECT:test by them");
+        } else {
+            harness.summary(50, &PROPOSAL.replace("Protocol_Version:1.2", "Protocol_Version:1.1"));
+        }
+        let rejected = terminal_sequence(&harness);
+        assert_eq!(proposal_ends(&harness)[0].0.is_some(), accepted);
+        harness.summary(70, PROPOSAL);
+        assert_eq!(game_start_sequences(&harness).len(), usize::from(accepted));
+        harness.feed(Event::LogCommitted { at: 80, seq: rejected + 1 });
+        assert_eq!(game_start_sequences(&harness).len(), usize::from(accepted));
+        let committed = harness.feed(Event::LogCommitted { at: 90, seq: rejected });
+        assert!(server_lines(&committed).iter().any(|line| line.starts_with("AGREE")));
+        assert_eq!(game_start_sequences(&harness).len(), usize::from(accepted) + 1);
+    }
+}
+
+#[test]
+fn log_completion_barrier_keeps_keepalive_and_engine_drain_live() {
+    let mut settings = forever_config();
+    settings.x1 = true;
+    settings.game_name = Some("barrier-test".into());
+    settings.keepalive_interval_ms = 30_000;
+    let mut harness = Harness::new(settings);
+    harness.core.enable_log_completion_barrier();
+    harness.start_game(PROPOSAL);
+    harness.server(30_000, "#LOSE");
+    let terminal = terminal_sequence(&harness);
+    assert_eq!(harness.core.next_deadline(), Some(30_050));
+    assert!(harness
+        .tick(30_050)
+        .iter()
+        .any(|action| matches!(action, Action::SendServer(rsshogi_csa::CsaCommand::KeepAlive))));
+    assert_eq!(harness.core.next_deadline(), Some(31_000));
+    assert!(harness.tick(31_000).contains(&Action::SpawnEngine));
+    harness.engine(31_010, "usiok");
+    let ready = harness.engine(31_020, "readyok");
+    assert!(!server_lines(&ready).iter().any(|line| line.starts_with("%%GAME")));
+    let committed = harness.feed(Event::LogCommitted { at: 31_030, seq: terminal });
+    assert!(server_lines(&committed).iter().any(|line| line.starts_with("%%GAME")));
+}
+
+#[test]
+fn locally_rejected_x1_proposal_waits_for_server_notice_and_log_commit_in_either_order() {
+    for explicit_game_name in [false, true] {
+        for log_first in [false, true] {
+            let mut settings = forever_config();
+            settings.x1 = true;
+            settings.game_name = explicit_game_name.then(|| "rejection-test".into());
+            let mut harness = Harness::new(settings);
+            harness.core.enable_log_completion_barrier();
+            harness.feed(Event::Started { at: 0 });
+            harness.engine(10, "usiok");
+            harness.engine(20, "readyok");
+            harness.feed(Event::Connected { at: 30 });
+            harness.server(40, "LOGIN:us OK");
+            let mark = harness.mark();
+            harness.summary(50, &PROPOSAL.replace("Protocol_Version:1.2", "Protocol_Version:1.1"));
+            assert!(!server_lines(harness.since(mark))
+                .iter()
+                .any(|line| line.starts_with("%%GAME")));
+            let rejected = terminal_sequence(&harness);
+            let first = if log_first {
+                harness.feed(Event::LogCommitted { at: 60, seq: rejected })
+            } else {
+                harness.server(60, "REJECT:test by us")
+            };
+            assert!(!server_lines(&first).iter().any(|line| line.starts_with("%%GAME")));
+            let second = if log_first {
+                harness.server(70, "REJECT:test by us")
+            } else {
+                harness.feed(Event::LogCommitted { at: 70, seq: rejected })
+            };
+            let registrations =
+                server_lines(&second).iter().filter(|line| line.starts_with("%%GAME")).count();
+            assert_eq!(registrations, usize::from(explicit_game_name), "log_first={log_first}");
+            assert!(server_lines(&harness.server(80, "REJECT:test by us")).is_empty());
+            assert!(server_lines(&harness.feed(Event::LogCommitted { at: 90, seq: rejected }))
+                .is_empty());
+            assert!(server_lines(&harness.tick(100)).is_empty());
+            assert_eq!(proposal_ends(&harness).len(), 1);
+        }
+    }
+}
+
+#[test]
+fn locally_rejected_x1_proposal_without_barrier_still_waits_for_server_notice() {
+    let mut settings = forever_config();
+    settings.x1 = true;
+    settings.game_name = Some("rejection-test".into());
+    let mut harness = Harness::new(settings);
+    harness.feed(Event::Started { at: 0 });
+    harness.engine(10, "usiok");
+    harness.engine(20, "readyok");
+    harness.feed(Event::Connected { at: 30 });
+    harness.server(40, "LOGIN:us OK");
+    harness.summary(50, &PROPOSAL.replace("Protocol_Version:1.2", "Protocol_Version:1.1"));
+    assert!(server_lines(&harness.tick(55)).is_empty());
+    assert_eq!(server_lines(&harness.server(60, "REJECT:test by us")), ["%%GAME rejection-test *"]);
+    assert!(server_lines(&harness.server(70, "REJECT:test by us")).is_empty());
+    assert_eq!(proposal_ends(&harness).len(), 1);
 }

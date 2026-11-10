@@ -22,13 +22,15 @@ pub mod probe;
 pub mod record;
 pub mod session;
 pub mod shell;
+pub mod split_log;
 
 pub use clock::{ClockError, ClockKind, ClockLedger, ClockRules, MoveBudget, UsiGoTimes};
 pub use config::{usi_entering_king_rule, BridgeConfig, PanicPolicy};
 pub use game_state::{entering_king_rule_for, GameState, GameStateError, PlayedMove};
 pub use record::{
-    AlertCode, AlertLevel, EvalRecord, GameResult, LogRecord, Millis, MoveOrigin, MoveRecord,
-    Phase, PlayerNames, PonderOutcome, RecordBody, Side, TimeSummary,
+    AlertCode, AlertLevel, ConnectionEvent, EvalRecord, GameResult, LogRecord, Millis, MoveOrigin,
+    MoveRecord, Phase, PlayerNames, PonderOutcome, ProposalEndReason, RecordBody, Side,
+    TimeSummary,
 };
 pub use session::{Action, Event, OperatorCommand, SessionCore};
 pub use shell::ShellConfig;
