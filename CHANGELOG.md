@@ -32,6 +32,7 @@
 - bridgeのRust APIでは`BridgeConfig`へ準備期限の3フィールドを追加した。
   struct literalを使うconsumerは追加指定が必要になるため、0.2.0とした。
   `BridgeConfig::floodgate`を使う場合は既定値が設定される。
+- `Action::Probe`と`probe`モジュールを公開した。Actionを網羅的にmatchするconsumerは新variantの処理が必要になる。
 - codecの公開型と整数Tのparse/formatは維持する。両crateのversionは0.2.0に揃える。
 - wire/engineログの送信行は、投入時点からローカルwrite完了時点の記録に変わる。
   serverの受理を示すものではない。

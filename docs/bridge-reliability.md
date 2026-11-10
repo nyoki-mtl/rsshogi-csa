@@ -93,6 +93,7 @@ CSA棋譜形式の対応範囲とネットワーク対局の必須条件を混�
 - preflightでも`stop_grace_ms < margin_ms`を検査する。600/500msは算術条件を満たすが、残る100msの実環境での十分性は別途測定する。
 - GPUの初期化が5分を超える場合は`--ready-timeout-ms`を明示する。0による無制限化はできない。
 - RustでBridgeConfigを直接構築するconsumerは追加3フィールドを指定するか、`BridgeConfig::floodgate`から設定する。
+- Actionを網羅的にmatchするRust consumerは、新しい`Action::Probe`を処理する。`probe`モジュールの診断出力は損失許容とし、対局制御の成功条件に含めない。
 - `go.deadline_at`と既存event schemaの移行は不要。通常ログのout行はwrite完了になったため、投入時刻として扱わない。
 - binaryはrelease tagを固定し、Rust 1.95.0と同梱Cargo.lockで`cargo build --locked --release -p rsshogi-csa-bridge --bin csabridge`を実行する。
 - 公式LOGIN形式、運営側game_name変更、公式大会での連続対局は未確認。公式テストセッションで実交換列を記録して資格確認する。
