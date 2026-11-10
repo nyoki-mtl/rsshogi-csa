@@ -28,6 +28,7 @@
 
 ### Changed
 
+- `rust-toolchain.toml`を1.95.0へ固定し、ローカル、CI、配布binaryのbuild条件を揃える。
 - bridgeのRust APIでは`BridgeConfig`へ準備期限の3フィールドを追加した。
   struct literalを使うconsumerは追加指定が必要になるため、0.2.0とした。
   `BridgeConfig::floodgate`を使う場合は既定値が設定される。
